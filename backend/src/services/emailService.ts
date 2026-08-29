@@ -1,0 +1,149 @@
+import nodemailer from 'nodemailer';
+import crypto from 'crypto';
+import { config } from '../config';
+
+/**
+ * Reusable Nodemailer transporter for global/default Ethereal SMTP
+ */
+const defaultTransporter = nodemailer.createTransport({
+  host: config.smtp.host,
+  port: config.smtp.port,
+  secure: config.smtp.secure,
+  auth: {
+    user: config.smtp.user,
+    pass: config.smtp.pass,
+  },
+});
+
+export interface SendEmailOptions {
+  sender?: {
+    id: string;
+    email: string;
+    smtp_host: string;
+    smtp_port: number;
+    smtp_secure: boolean;
+    smtp_user: string;
+    smtp_pass: string;
+  };
+  to: string;
+  subject: string;
+  text: string;
+  html: string;
+}
+
+export interface SendEmailResult {
+  messageId: string;
+  previewUrl: string | false;
+}
+
+interface CachedTransporter {
+  transporter: nodemailer.Transporter;
+  hash: string;
+}
+
+// Local cache for Nodemailer transporters keyed by sender ID
+const transporterCache = new Map<string, CachedTransporter>();
+
+/**
+ * Generates a SHA-256 hash of a sender's SMTP credentials.
+ * Ensures the cache is invalidated if the credentials change,
+ * without storing plaintext passwords in the cache map.
+ */
+function getSenderHash(sender: NonNullable<SendEmailOptions['sender']>): string {
+  const data = `${sender.smtp_host}:${sender.smtp_port}:${sender.smtp_secure}:${sender.smtp_user}:${sender.smtp_pass}`;
+  return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+/**
+ * Returns a cached transporter for the sender, creating it if it doesn't exist,
+ * or recreating it if the SMTP credentials have changed.
+ */
+function getOrCreateTransporter(sender: NonNullable<SendEmailOptions['sender']>): nodemailer.Transporter {
+  const currentHash = getSenderHash(sender);
+  const cached = transporterCache.get(sender.id);
+
+  if (cached) {
+    if (cached.hash === currentHash) {
+      return cached.transporter;
+    }
+    // Credentials have changed, close the old transporter to release idle connections
+    try {
+      cached.transporter.close();
+    } catch (err) {
+      console.error(`⚠️ [Nodemailer] Failed to close old transporter for sender ${sender.id}:`, err);
+    }
+  }
+
+  // Create new transporter
+  const transporter = nodemailer.createTransport({
+    host: sender.smtp_host,
+    port: sender.smtp_port,
+    secure: sender.smtp_secure,
+    auth: {
+      user: sender.smtp_user,
+      pass: sender.smtp_pass,
+    },
+  });
+
+  transporterCache.set(sender.id, { transporter, hash: currentHash });
+  return transporter;
+}
+
+/**
+ * Validates configuration, constructs the mail options, and sends the email.
+ * If sender is provided, uses the cached transporter corresponding to that sender,
+ * otherwise falls back to the default global transporter.
+ */
+export async function sendEmail({ sender, to, subject, text, html }: SendEmailOptions): Promise<SendEmailResult> {
+  if (!to || !subject || !text || !html) {
+    throw new Error('Missing required fields for sendEmail (to, subject, text, html).');
+  }
+
+  let transporter: nodemailer.Transporter;
+  let fromAddress: string;
+
+  if (sender) {
+    transporter = getOrCreateTransporter(sender);
+    fromAddress = `"${sender.email}" <${sender.email}>`;
+  } else {
+    transporter = defaultTransporter;
+    fromAddress = config.smtp.from;
+  }
+
+  const info = await transporter.sendMail({
+    from: fromAddress,
+    to,
+    subject,
+    text,
+    html,
+  });
+
+  const previewUrl = nodemailer.getTestMessageUrl(info);
+
+  return {
+    messageId: info.messageId,
+    previewUrl,
+  };
+}
+
+/**
+ * Development test helper to verify the default/global SMTP connection without sending an email.
+ */
+export async function verifyConnection(): Promise<boolean> {
+  return await defaultTransporter.verify();
+}
+
+/**
+ * Closes all open cached SMTP transporters and clears the cache.
+ */
+export function clearTransporterCache(): void {
+  for (const [id, cached] of transporterCache.entries()) {
+    try {
+      cached.transporter.close();
+    } catch (err) {
+      console.error(`⚠️ [Nodemailer] Failed to close transporter cache for ${id}:`, err);
+    }
+  }
+  transporterCache.clear();
+}
+
