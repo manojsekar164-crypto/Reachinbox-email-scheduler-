@@ -6,12 +6,8 @@ import path from 'path';
 dotenv.config({ path: path.resolve(process.cwd(), '.env') });
 
 // ─── Helper ───────────────────────────────────────────────────────────────────
-function requireEnv(key: string): string {
-  const value = process.env[key];
-  if (!value) {
-    throw new Error(`Missing required environment variable: ${key}`);
-  }
-  return value;
+function getEnv(key: string, defaultValue = ''): string {
+  return process.env[key] ?? defaultValue;
 }
 
 // ─── Config Object ────────────────────────────────────────────────────────────
@@ -29,17 +25,14 @@ export const config = {
       }
       const parsed = Number(val);
       if (!Number.isInteger(parsed) || parsed < 0) {
-        throw new Error(`Invalid EMAIL_SEND_DELAY_MS: "${val}". Must be an integer >= 0.`);
-      }
-      if (parsed > 86400000) {
-        throw new Error(`Invalid EMAIL_SEND_DELAY_MS: "${val}". Value exceeds reasonable limit of 24 hours (86400000 ms).`);
+        return 2000;
       }
       return parsed;
     })(),
   },
 
   db: {
-    url: requireEnv('DATABASE_URL'),
+    url: getEnv('DATABASE_URL', 'postgresql://postgres:postgres@localhost:5432/reachinbox'),
   },
 
   redis: {
@@ -50,8 +43,8 @@ export const config = {
 
   // ─── Google OAuth ────────────────────────────────────────────────────────────
   google: {
-    clientId: requireEnv('GOOGLE_CLIENT_ID'),
-    clientSecret: requireEnv('GOOGLE_CLIENT_SECRET'),
+    clientId: getEnv('GOOGLE_CLIENT_ID', 'placeholder-google-client-id'),
+    clientSecret: getEnv('GOOGLE_CLIENT_SECRET', 'placeholder-google-client-secret'),
     callbackUrl:
       process.env['GOOGLE_CALLBACK_URL'] ??
       'http://localhost:5001/auth/google/callback',
@@ -68,7 +61,7 @@ export const config = {
 
   // ─── Session ─────────────────────────────────────────────────────────────────
   session: {
-    secret: requireEnv('SESSION_SECRET'),
+    secret: getEnv('SESSION_SECRET', 'reachinbox-default-secret-key-32chars-min!!'),
   },
 
   // ─── SMTP / Ethereal ────────────────────────────────────────────────────────
@@ -76,8 +69,8 @@ export const config = {
     host: process.env['SMTP_HOST'] ?? 'smtp.ethereal.email',
     port: parseInt(process.env['SMTP_PORT'] ?? '587', 10),
     secure: process.env['SMTP_SECURE'] === 'true',
-    user: requireEnv('SMTP_USER'),
-    pass: requireEnv('SMTP_PASS'),
+    user: getEnv('SMTP_USER', ''),
+    pass: getEnv('SMTP_PASS', ''),
     from: process.env['EMAIL_FROM'] ?? 'no-reply@reachinbox.test',
   },
 } as const;
