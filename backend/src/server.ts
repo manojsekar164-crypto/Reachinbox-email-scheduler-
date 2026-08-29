@@ -18,6 +18,15 @@ async function bootstrap(): Promise<void> {
     );
   });
 
+  // ─── Start Background Email Worker (Inline) ────────────────────────────────
+  if (process.env['ENABLE_INLINE_WORKER'] !== 'false') {
+    import('./workers/emailWorker').then(() => {
+      console.log('👷  Inline BullMQ email worker started inside server process');
+    }).catch((err) => {
+      console.error('Failed to start inline worker:', err);
+    });
+  }
+
   // ─── Graceful shutdown ─────────────────────────────────────────────────────
   async function shutdown(signal: string): Promise<void> {
     console.log(`\n⚠️   Received ${signal}. Shutting down gracefully…`);
