@@ -1,4 +1,4 @@
-﻿/**
+/**
  * src/db/migrate.ts
  *
  * Reads 001_initial_schema.sql and executes it against PostgreSQL.
@@ -15,7 +15,14 @@ import { db, connectDB, disconnectDB } from './postgres';
 async function runMigrations(): Promise<void> {
   console.log('🔄  Running database migrations…');
 
-  const migrationsDir = path.join(__dirname, 'migrations');
+  let migrationsDir = path.join(__dirname, 'migrations');
+  if (!fs.existsSync(migrationsDir)) {
+    migrationsDir = path.join(process.cwd(), 'src', 'db', 'migrations');
+  }
+  if (!fs.existsSync(migrationsDir)) {
+    migrationsDir = path.join(process.cwd(), 'dist', 'db', 'migrations');
+  }
+
   const migrationFiles = fs
     .readdirSync(migrationsDir)
     .filter((f) => f.endsWith('.sql'))
