@@ -59,6 +59,10 @@ export function createApp(): Application {
   app.use(express.json({ limit: '10mb' }));
   app.use(express.urlencoded({ extended: true }));
 
+  if (config.app.isProd) {
+    app.set('trust proxy', 1);
+  }
+
   // ─── Logging ────────────────────────────────────────────────────────────────
   app.use(requestLogger);
 
@@ -71,8 +75,8 @@ export function createApp(): Application {
       saveUninitialized: false, // don't create session until something is stored
       cookie: {
         httpOnly: true,        // not accessible from JavaScript in the browser
-        secure: false,         // false for local HTTP development; set true in prod
-        sameSite: 'lax',       // CSRF protection while allowing top-level navigations
+        secure: config.app.isProd, // true in production behind HTTPS
+        sameSite: config.app.isProd ? 'none' : 'lax', // 'none' for cross-domain HTTPS
         maxAge: 24 * 60 * 60 * 1000, // 24 hours
       },
     }),

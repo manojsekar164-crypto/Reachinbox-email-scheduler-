@@ -1,19 +1,25 @@
 import Redis from 'ioredis';
 import { config } from '../config';
 
-export const redis = new Redis({
-  host: config.redis.host,
-  port: config.redis.port,
-  // Retry aggressively during startup; back off after 10 attempts
-  retryStrategy: (times: number) => {
-    if (times > 10) {
-      console.error('❌  Redis: max retries reached, giving up');
-      return null; // stop retrying
-    }
-    return Math.min(times * 100, 3_000);
-  },
-  lazyConnect: true,
-});
+export const redis = config.redis.url
+  ? new Redis(config.redis.url, {
+      maxRetriesPerRequest: null,
+      lazyConnect: true,
+      tls: config.redis.url.startsWith('rediss://') ? { rejectUnauthorized: false } : undefined,
+    })
+  : new Redis({
+      host: config.redis.host,
+      port: config.redis.port,
+      // Retry aggressively during startup; back off after 10 attempts
+      retryStrategy: (times: number) => {
+        if (times > 10) {
+          console.error('❌  Redis: max retries reached, giving up');
+          return null; // stop retrying
+        }
+        return Math.min(times * 100, 3_000);
+      },
+      lazyConnect: true,
+    });
 
 /**
  * Open the Redis connection and verify with PING.

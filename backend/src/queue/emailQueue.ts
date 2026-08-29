@@ -14,12 +14,17 @@ export interface EmailJobPayload {
 // ---------------------------------------------------------------------------
 
 // BullMQ requires maxRetriesPerRequest to be null for its Redis connections.
-// We use the existing host and port from config.
-export const redisConnectionOptions = {
-  host: config.redis.host,
-  port: config.redis.port,
-  maxRetriesPerRequest: null,
-};
+export const redisConnectionOptions: any = config.redis.url
+  ? {
+      url: config.redis.url,
+      maxRetriesPerRequest: null,
+      tls: config.redis.url.startsWith('rediss://') ? { rejectUnauthorized: false } : undefined,
+    }
+  : {
+      host: config.redis.host,
+      port: config.redis.port,
+      maxRetriesPerRequest: null,
+    };
 
 // Sensible defaults to ensure failing jobs back off and completed jobs do not bloat Redis.
 const defaultJobOptions: DefaultJobOptions = {
