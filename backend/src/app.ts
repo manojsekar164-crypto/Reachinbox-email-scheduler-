@@ -1,6 +1,8 @@
 import express, { Application } from 'express';
 import cors from 'cors';
 import session from 'express-session';
+import pgSession from 'connect-pg-simple';
+import { db } from './db/postgres';
 import { config } from './config';
 import rootRouter from './routes';
 import { notFoundHandler, errorHandler } from './middleware/errorHandler';
@@ -67,9 +69,17 @@ export function createApp(): Application {
   app.use(requestLogger);
 
   // ─── Session ─────────────────────────────────────────────────────────────────
-  // Must be registered BEFORE passport middleware.
+  // Persisted in PostgreSQL so sessions survive server restarts and redeployments.
+  const PgSessionStore = pgSession(session);
+  const sessionStore = new PgSessionStore({
+    pool: db,
+    tableName: 'user_sessions',
+    createTableIfMissing: true,
+  });
+
   app.use(
     session({
+      store: sessionStore,
       secret: config.session.secret,
       resave: false,           // don't write session back if unmodified
       saveUninitialized: false, // don't create session until something is stored
@@ -77,7 +87,7 @@ export function createApp(): Application {
         httpOnly: true,        // not accessible from JavaScript in the browser
         secure: config.app.isProd, // true in production behind HTTPS
         sameSite: config.app.isProd ? 'none' : 'lax', // 'none' for cross-domain HTTPS
-        maxAge: 24 * 60 * 60 * 1000, // 24 hours
+        maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
       },
     }),
   );
