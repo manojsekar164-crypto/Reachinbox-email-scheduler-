@@ -2,7 +2,7 @@ import { Worker, Job, DelayedError } from 'bullmq';
 import { emailQueueName, EmailJobPayload, redisConnectionOptions } from '../queue/emailQueue';
 import { sendEmail } from '../services/emailService';
 import { checkRateLimit } from '../services/rateLimiter';
-import { handleRateLimitNotification } from '../services/slackService';
+import { handleRateLimitNotification, notifyCampaignCompleted } from '../services/slackService';
 import { indexEmailAsSent } from '../services/searchService';
 import { db as pool } from '../db/postgres';
 import { CampaignRow, RecipientRow } from '../types/db.types';
@@ -173,6 +173,13 @@ export const worker = new Worker<EmailJobPayload, void, string>(
         if (remaining === 0) {
           await pool.query("UPDATE campaigns SET status = 'completed', updated_at = NOW() WHERE id = $1", [campaignId]);
           console.log(`🎉 [Campaign ${campaignId}] All recipients processed. Campaign marked completed.`);
+          
+          // Send completion notification to Slack
+          try {
+            await notifyCampaignCompleted(campaign.user_id, campaignId, campaign.subject);
+          } catch (slackErr: any) {
+            console.warn(`⚠️ [Slack] Failed to send completion notification: ${slackErr.message}`);
+          }
         } else {
           await pool.query("UPDATE campaigns SET status = 'sending', updated_at = NOW() WHERE id = $1 AND status != 'sending'", [campaignId]);
         }

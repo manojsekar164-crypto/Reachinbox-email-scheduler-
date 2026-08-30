@@ -16,6 +16,7 @@
 import { db } from '../db/postgres';
 import { indexScheduledEmails } from './searchService';
 import { scheduleEmailJobs } from './schedulingService';
+import { notifyCampaignCreated } from './slackService';
 import {
   CampaignRow,
   CampaignStatus,
@@ -125,6 +126,18 @@ export async function createCampaignWithRecipients(
       console.error(
         `❌ [Scheduler] Failed to enqueue jobs for campaign ${campaign.id}: ${queueErr.message}`,
       );
+    }
+
+    // Trigger Slack notification for campaign launch (isolated and non-blocking)
+    try {
+      await notifyCampaignCreated(
+        campaign.user_id,
+        campaign.subject,
+        recipients.length,
+        campaign.hourly_limit,
+      );
+    } catch (slackErr: any) {
+      console.warn(`⚠️ [Slack] Failed to send launch notification: ${slackErr.message}`);
     }
 
     return { ...campaign, recipients };

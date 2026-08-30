@@ -164,3 +164,55 @@ function formatDuration(ms: number): string {
   return `${pad(mins)}:${pad(secs)}`;
 }
 
+/**
+ * Sends a Slack notification when a new campaign is composed & queued.
+ */
+export async function notifyCampaignCreated(
+  userId: string,
+  subject: string,
+  recipientCount: number,
+  hourlyLimit: number,
+): Promise<void> {
+  try {
+    const integration = await getSlackIntegrationByUserId(userId);
+    if (!integration || !integration.webhook_url) return;
+
+    const message = `🚀 *ReachInbox Campaign Launched*
+
+*Campaign:* ${subject}
+*Recipients:* ${recipientCount} leads
+*Rate Limit:* ${hourlyLimit} emails/hour
+*Status:* Enqueued & processing in queue`;
+
+    await sendSlackNotification(message, integration.webhook_url);
+    console.log(`✅ [Slack] Campaign created notification sent for: ${subject}`);
+  } catch (err: any) {
+    console.warn(`⚠️ [Slack] Campaign created notification failed: ${err.message}`);
+  }
+}
+
+/**
+ * Sends a Slack notification when all emails in a campaign are delivered.
+ */
+export async function notifyCampaignCompleted(
+  userId: string,
+  campaignId: string,
+  subject: string,
+): Promise<void> {
+  try {
+    const integration = await getSlackIntegrationByUserId(userId);
+    if (!integration || !integration.webhook_url) return;
+
+    const message = `🎉 *ReachInbox Campaign Completed*
+
+*Campaign:* ${subject}
+*Campaign ID:* ${campaignId}
+*Status:* All recipients delivered successfully!`;
+
+    await sendSlackNotification(message, integration.webhook_url);
+    console.log(`✅ [Slack] Campaign completed notification sent for: ${subject}`);
+  } catch (err: any) {
+    console.warn(`⚠️ [Slack] Campaign completed notification failed: ${err.message}`);
+  }
+}
+
