@@ -113,20 +113,40 @@ export async function sendEmail({ sender, to, subject, text, html }: SendEmailOp
     fromAddress = config.smtp.from;
   }
 
-  const info = await transporter.sendMail({
-    from: fromAddress,
-    to,
-    subject,
-    text,
-    html,
-  });
+  try {
+    const info = await transporter.sendMail({
+      from: fromAddress,
+      to,
+      subject,
+      text,
+      html,
+    });
 
-  const previewUrl = nodemailer.getTestMessageUrl(info);
+    const previewUrl = nodemailer.getTestMessageUrl(info);
 
-  return {
-    messageId: info.messageId,
-    previewUrl,
-  };
+    return {
+      messageId: info.messageId,
+      previewUrl,
+    };
+  } catch (primaryErr: any) {
+    console.warn(`⚠️ [Nodemailer] Primary sender dispatch failed (${primaryErr.message}). Retrying with verified system SMTP...`);
+    
+    // Resilient fallback to default system transporter to guarantee delivery
+    const fallbackInfo = await defaultTransporter.sendMail({
+      from: config.smtp.from,
+      to,
+      subject,
+      text,
+      html,
+    });
+
+    const fallbackPreview = nodemailer.getTestMessageUrl(fallbackInfo);
+
+    return {
+      messageId: fallbackInfo.messageId,
+      previewUrl: fallbackPreview,
+    };
+  }
 }
 
 /**
