@@ -76,13 +76,19 @@ function getOrCreateTransporter(sender: NonNullable<SendEmailOptions['sender']>)
   }
 
   // Create new transporter
+  const port = Number(sender.smtp_port) || 587;
+  const isSecure = sender.smtp_secure || port === 465;
+
   const transporter = nodemailer.createTransport({
-    host: sender.smtp_host,
-    port: sender.smtp_port,
-    secure: sender.smtp_secure,
+    host: sender.smtp_host || 'smtp.ethereal.email',
+    port,
+    secure: isSecure,
     auth: {
       user: sender.smtp_user,
       pass: sender.smtp_pass,
+    },
+    tls: {
+      rejectUnauthorized: false,
     },
   });
 

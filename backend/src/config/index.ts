@@ -69,8 +69,8 @@ export const config = {
     host: process.env['SMTP_HOST'] ?? 'smtp.ethereal.email',
     port: parseInt(process.env['SMTP_PORT'] ?? '587', 10),
     secure: process.env['SMTP_SECURE'] === 'true',
-    user: getEnv('SMTP_USER', ''),
-    pass: getEnv('SMTP_PASS', ''),
-    from: process.env['EMAIL_FROM'] ?? 'no-reply@reachinbox.test',
+    user: getEnv('SMTP_USER', 'yictoylywednjiug@ethereal.email'),
+    pass: getEnv('SMTP_PASS', 'nTeCFEYgHEVPDh8dTx'),
+    from: process.env['EMAIL_FROM'] ?? 'yictoylywednjiug@ethereal.email',
   },
 } as const;
