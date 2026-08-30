@@ -263,7 +263,7 @@ export async function deleteCampaignForUser(
 export async function getRecipientsForCampaign(
   campaignId: string,
   userId: string,
-): Promise<RecipientRow[] | null> {
+): Promise<any[] | null> {
   // Verify ownership first
   const { rows: campaignRows } = await db.query<CampaignRow>(
     `SELECT id FROM campaigns WHERE id = $1 AND user_id = $2`,
@@ -271,8 +271,25 @@ export async function getRecipientsForCampaign(
   );
   if (!campaignRows[0]) return null;
 
-  const { rows } = await db.query<RecipientRow>(
-    `SELECT * FROM recipients WHERE campaign_id = $1 ORDER BY created_at`,
+  const { rows } = await db.query(
+    `SELECT 
+       r.id,
+       r.campaign_id,
+       r.email,
+       r.name,
+       r.created_at,
+       COALESCE(el.status, 'queued') as status,
+       el.error_message,
+       el.sent_at
+     FROM recipients r
+     LEFT JOIN (
+       SELECT DISTINCT ON (recipient_id) recipient_id, status, error_message, sent_at
+       FROM email_logs
+       WHERE campaign_id = $1
+       ORDER BY recipient_id, created_at DESC
+     ) el ON el.recipient_id = r.id
+     WHERE r.campaign_id = $1
+     ORDER BY r.created_at`,
     [campaignId],
   );
   return rows;

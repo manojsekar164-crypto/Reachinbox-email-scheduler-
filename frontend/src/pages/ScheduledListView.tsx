@@ -242,18 +242,36 @@ export const ScheduledListView: React.FC<ScheduledListViewProps> = ({
                 ) : recipients.length === 0 ? (
                   <div className="py-6 text-center text-slate-400">No recipients found for this campaign.</div>
                 ) : (
-                  <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden max-h-48 overflow-y-auto">
-                    {recipients.map((r) => (
-                      <div key={r.id} className="p-2.5 flex items-center justify-between bg-white hover:bg-slate-50">
-                        <div>
-                          <p className="font-semibold text-slate-900">{r.email}</p>
-                          {r.name && <p className="text-[10px] text-slate-400">{r.name}</p>}
+                  <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden max-h-56 overflow-y-auto">
+                    {recipients.map((r: any) => {
+                      const st = (r.status || 'queued').toLowerCase();
+                      let badgeClass = 'bg-amber-50 text-amber-700 border border-amber-200';
+                      let label = '⏳ Queued';
+                      if (st === 'sent') {
+                        badgeClass = 'bg-emerald-50 text-emerald-700 border border-emerald-200';
+                        label = '✓ Sent';
+                      } else if (st === 'failed') {
+                        badgeClass = 'bg-rose-50 text-rose-700 border border-rose-200';
+                        label = '✕ Failed';
+                      }
+
+                      return (
+                        <div key={r.id} className="p-2.5 flex items-center justify-between bg-white hover:bg-slate-50 gap-2">
+                          <div className="min-w-0 flex-1">
+                            <p className="font-semibold text-slate-900 truncate">{r.email}</p>
+                            {r.name && <p className="text-[10px] text-slate-400">{r.name}</p>}
+                            {r.error_message && (
+                              <p className="text-[10px] text-rose-600 truncate mt-0.5" title={r.error_message}>
+                                {r.error_message}
+                              </p>
+                            )}
+                          </div>
+                          <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full shrink-0 ${badgeClass}`}>
+                            {label}
+                          </span>
                         </div>
-                        <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-slate-100 text-slate-600">
-                          Queued
-                        </span>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </div>
