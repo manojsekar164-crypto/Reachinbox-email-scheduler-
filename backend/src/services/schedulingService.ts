@@ -42,29 +42,18 @@ export async function scheduleEmailJobs(
   campaign: CampaignRow,
   recipients: RecipientRow[],
 ): Promise<void> {
-  const scheduledAt = campaign.scheduled_at;
+  const scheduledAt = campaign.scheduled_at ? new Date(campaign.scheduled_at) : null;
   const now = Date.now();
 
-  // Calculate delay. If no scheduled_at, fire immediately (delay = 0).
+  // Calculate delay in milliseconds. If no scheduled_at, fire immediately (delay = 0).
   const rawDelayMs = scheduledAt ? scheduledAt.getTime() - now : 0;
   const delayMs = Math.max(0, rawDelayMs); // never negative
 
-  if (!scheduledAt) {
-    // Phase 9E is specifically for scheduled sends.
-    // Unscheduled campaigns (immediate/draft) do not create delayed jobs.
-    return;
-  }
-
   console.log(
-    `[Scheduler] Scheduling campaign ${campaign.id} for ${recipients.length} recipient(s)`,
+    `[Scheduler] Scheduling campaign ${campaign.id} for ${recipients.length} recipient(s) [delayMs=${delayMs}]`,
   );
-  console.log(`[Scheduler] scheduledAt=${scheduledAt.toISOString()}`);
-  console.log(`[Scheduler] delayMs=${delayMs}`);
-  if (delayMs === 0 && rawDelayMs < 0) {
-    console.warn(
-      `[Scheduler] Warning: scheduled_at is slightly in the past (${Math.abs(rawDelayMs)}ms). ` +
-        `Enqueuing immediately.`,
-    );
+  if (scheduledAt) {
+    console.log(`[Scheduler] scheduledAt=${scheduledAt.toISOString()}`);
   }
 
   for (const recipient of recipients) {
@@ -78,16 +67,14 @@ export async function scheduleEmailJobs(
       // Job-level options inherit queue defaults (attempts=3, backoff=exponential).
     });
 
-    if (scheduledAt && delayMs > 0) {
+    if (delayMs > 0) {
       const fireAt = new Date(now + delayMs).toISOString();
       console.log(
-        `[Scheduler] Job ${job.id} delayed until ${fireAt} ` +
-          `(recipient=${recipient.id})`,
+        `[Scheduler] Job ${job.id} delayed until ${fireAt} (recipient=${recipient.id})`,
       );
     } else {
       console.log(
-        `[Scheduler] Job ${job.id} enqueued immediately ` +
-          `(recipient=${recipient.id})`,
+        `[Scheduler] Job ${job.id} enqueued for immediate delivery (recipient=${recipient.id})`,
       );
     }
   }
