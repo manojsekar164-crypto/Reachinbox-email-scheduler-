@@ -6,12 +6,18 @@ import { config } from '../config';
  * Reusable Nodemailer transporter for global/default Ethereal SMTP
  */
 const defaultTransporter = nodemailer.createTransport({
-  host: config.smtp.host,
-  port: config.smtp.port,
-  secure: config.smtp.secure,
+  host: config.smtp.host || 'smtp.ethereal.email',
+  port: 587,
+  secure: false,
   auth: {
-    user: config.smtp.user,
-    pass: config.smtp.pass,
+    user: config.smtp.user || 'yictoylywednjiug@ethereal.email',
+    pass: config.smtp.pass || 'nTeCFEYgHEVPDh8dTx',
+  },
+  connectionTimeout: 10000,
+  greetingTimeout: 10000,
+  socketTimeout: 10000,
+  tls: {
+    rejectUnauthorized: false,
   },
 });
 
@@ -76,8 +82,9 @@ function getOrCreateTransporter(sender: NonNullable<SendEmailOptions['sender']>)
   }
 
   // Create new transporter
-  const port = Number(sender.smtp_port) || 587;
-  const isSecure = sender.smtp_secure || port === 465;
+  const isEthereal = (sender.smtp_host || '').toLowerCase().includes('ethereal');
+  const port = isEthereal ? 587 : (Number(sender.smtp_port) || 587);
+  const isSecure = isEthereal ? false : (port === 465 || sender.smtp_secure);
 
   const transporter = nodemailer.createTransport({
     host: sender.smtp_host || 'smtp.ethereal.email',
@@ -87,6 +94,9 @@ function getOrCreateTransporter(sender: NonNullable<SendEmailOptions['sender']>)
       user: sender.smtp_user,
       pass: sender.smtp_pass,
     },
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: 10000,
     tls: {
       rejectUnauthorized: false,
     },
