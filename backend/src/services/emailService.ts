@@ -18,6 +18,7 @@ const defaultTransporter = nodemailer.createTransport({
 export interface SendEmailOptions {
   sender?: {
     id: string;
+    name?: string;
     email: string;
     smtp_host: string;
     smtp_port: number;
@@ -104,7 +105,9 @@ export async function sendEmail({ sender, to, subject, text, html }: SendEmailOp
 
   if (sender) {
     transporter = getOrCreateTransporter(sender);
-    fromAddress = `"${sender.email}" <${sender.email}>`;
+    const fromEmail = sender.smtp_host.includes('ethereal') && sender.smtp_user ? sender.smtp_user : (sender.email || sender.smtp_user);
+    const displayName = (sender.name || sender.email).replace(/[<>"\r\n]/g, '').trim();
+    fromAddress = `"${displayName}" <${fromEmail}>`;
   } else {
     transporter = defaultTransporter;
     fromAddress = config.smtp.from;

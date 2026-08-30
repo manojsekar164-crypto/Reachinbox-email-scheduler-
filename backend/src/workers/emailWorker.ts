@@ -158,6 +158,27 @@ export const worker = new Worker<EmailJobPayload, void, string>(
       } catch (esErr: any) {
         console.error(`❌ [Elasticsearch] Sent email indexing failed: ${esErr.message}`);
       }
+
+      // Update campaign status if all recipients have been delivered
+      try {
+        const remainingCheck = await pool.query(
+          `SELECT COUNT(*) as remaining FROM recipients r
+           WHERE r.campaign_id = $1
+           AND NOT EXISTS (
+             SELECT 1 FROM email_logs el WHERE el.campaign_id = $1 AND el.recipient_id = r.id AND el.status = 'sent'
+           )`,
+          [campaignId]
+        );
+        const remaining = parseInt(remainingCheck.rows[0]?.remaining || '1', 10);
+        if (remaining === 0) {
+          await pool.query("UPDATE campaigns SET status = 'completed', updated_at = NOW() WHERE id = $1", [campaignId]);
+          console.log(`🎉 [Campaign ${campaignId}] All recipients processed. Campaign marked completed.`);
+        } else {
+          await pool.query("UPDATE campaigns SET status = 'sending', updated_at = NOW() WHERE id = $1 AND status != 'sending'", [campaignId]);
+        }
+      } catch (statusErr: any) {
+        console.warn(`⚠️ [Campaign ${campaignId}] Could not update status: ${statusErr.message}`);
+      }
       
     } catch (error: any) {
       // --- 6. Handle Send Failure ---

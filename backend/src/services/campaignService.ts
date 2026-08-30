@@ -78,9 +78,10 @@ export async function createCampaignWithRecipients(
     }
 
     // 1. Insert the campaign row
+    const initialStatus: CampaignStatus = input.scheduledAt ? 'scheduled' : 'sending';
     const { rows: campaignRows } = await client.query<CampaignRow>(
-      `INSERT INTO campaigns (user_id, sender_id, subject, body, scheduled_at, hourly_limit)
-       VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO campaigns (user_id, sender_id, subject, body, scheduled_at, hourly_limit, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING *`,
       [
         userId,
@@ -89,6 +90,7 @@ export async function createCampaignWithRecipients(
         input.body,
         input.scheduledAt ?? null,
         input.hourlyLimit,
+        initialStatus,
       ],
     );
     const campaign = campaignRows[0]!;
