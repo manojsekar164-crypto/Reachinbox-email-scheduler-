@@ -296,8 +296,144 @@ export async function searchEmails(
 
     return { count: total, results };
   } catch (error: any) {
-    console.error(`❌ [Elasticsearch] Search query failed: ${error.message}`);
-    throw error;
+    console.warn(`⚠️ [Elasticsearch] Unavailable (${error.message}). Falling back to PostgreSQL email_logs query...`);
+    return await searchEmailsPostgresFallback(userId, q, filters, pagination);
+  }
+}
+
+/**
+ * Robust PostgreSQL fallback for search and sent logs when Elasticsearch is offline.
+ */
+async function searchEmailsPostgresFallback(
+  userId: string,
+  q?: string,
+  filters?: {
+    status?: string;
+    scheduledAtStart?: string;
+    scheduledAtEnd?: string;
+    sentAtStart?: string;
+    sentAtEnd?: string;
+  },
+  pagination?: {
+    page?: number;
+    limit?: number;
+  }
+): Promise<{ count: number; results: any[] }> {
+  const page = Math.max(1, pagination?.page || 1);
+  const limit = Math.min(100, Math.max(1, pagination?.limit || 20));
+  const offset = (page - 1) * limit;
+
+  try {
+    if (filters?.status === 'scheduled') {
+      // Query scheduled recipients that have not been marked sent yet
+      const query = `
+        SELECT 
+          r.id as id,
+          c.id as "campaignId",
+          r.id as "recipientId",
+          r.email as "recipientEmail",
+          r.name as "recipientName",
+          c.subject,
+          'scheduled' as status,
+          c.scheduled_at as "scheduledAt",
+          NULL as "sentAt",
+          r.created_at as "createdAt",
+          s.id as "senderId",
+          s.email as "senderEmail",
+          s.name as "senderName"
+        FROM recipients r
+        JOIN campaigns c ON c.id = r.campaign_id
+        LEFT JOIN senders s ON s.id = c.sender_id
+        WHERE c.user_id = $1
+        AND NOT EXISTS (
+          SELECT 1 FROM email_logs el 
+          WHERE el.campaign_id = c.id AND el.recipient_id = r.id AND el.status = 'sent'
+        )
+        ${q ? 'AND (c.subject ILIKE $2 OR r.email ILIKE $2)' : ''}
+        ORDER BY r.created_at DESC
+        LIMIT $${q ? 3 : 2} OFFSET $${q ? 4 : 3}
+      `;
+      const params: any[] = [userId];
+      if (q) params.push(`%${q}%`);
+      params.push(limit, offset);
+
+      const countQuery = `
+        SELECT COUNT(*) as total
+        FROM recipients r
+        JOIN campaigns c ON c.id = r.campaign_id
+        WHERE c.user_id = $1
+        AND NOT EXISTS (
+          SELECT 1 FROM email_logs el 
+          WHERE el.campaign_id = c.id AND el.recipient_id = r.id AND el.status = 'sent'
+        )
+        ${q ? 'AND (c.subject ILIKE $2 OR r.email ILIKE $2)' : ''}
+      `;
+      const countParams = q ? [userId, `%${q}%`] : [userId];
+      const countRes = await db.query(countQuery, countParams);
+      const total = parseInt(countRes.rows[0]?.total || '0', 10);
+      const rowsRes = await db.query(query, params);
+
+      return { count: total, results: rowsRes.rows };
+    }
+
+    // Default: Query email_logs for sent/failed emails
+    let baseWhere = 'WHERE c.user_id = $1';
+    const params: any[] = [userId];
+
+    if (filters?.status) {
+      params.push(filters.status);
+      baseWhere += ` AND el.status = $${params.length}`;
+    }
+
+    if (q && q.trim()) {
+      params.push(`%${q.trim()}%`);
+      baseWhere += ` AND (c.subject ILIKE $${params.length} OR r.email ILIKE $${params.length})`;
+    }
+
+    const countQuery = `
+      SELECT COUNT(*) as total 
+      FROM email_logs el
+      JOIN campaigns c ON c.id = el.campaign_id
+      JOIN recipients r ON r.id = el.recipient_id
+      ${baseWhere}
+    `;
+    const countRes = await db.query(countQuery, params);
+    const total = parseInt(countRes.rows[0]?.total || '0', 10);
+
+    params.push(limit);
+    const limitIdx = params.length;
+    params.push(offset);
+    const offsetIdx = params.length;
+
+    const dataQuery = `
+      SELECT 
+        el.id,
+        el.campaign_id as "campaignId",
+        el.recipient_id as "recipientId",
+        r.email as "recipientEmail",
+        r.name as "recipientName",
+        c.subject,
+        el.status,
+        c.scheduled_at as "scheduledAt",
+        el.sent_at as "sentAt",
+        el.created_at as "createdAt",
+        s.id as "senderId",
+        s.email as "senderEmail",
+        s.name as "senderName"
+      FROM email_logs el
+      JOIN campaigns c ON c.id = el.campaign_id
+      JOIN recipients r ON r.id = el.recipient_id
+      LEFT JOIN senders s ON s.id = el.sender_id
+      ${baseWhere}
+      ORDER BY el.created_at DESC
+      LIMIT $${limitIdx} OFFSET $${offsetIdx}
+    `;
+    const rowsRes = await db.query(dataQuery, params);
+
+    return { count: total, results: rowsRes.rows };
+  } catch (pgErr: any) {
+    console.error(`❌ [Database] PostgreSQL search fallback failed: ${pgErr.message}`);
+    return { count: 0, results: [] };
   }
 }
 
