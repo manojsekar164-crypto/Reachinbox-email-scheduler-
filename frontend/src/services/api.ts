@@ -16,8 +16,8 @@ export const authApi = {
 };
 
 export const campaignApi = {
-  list: (params?: { status?: string }) => apiClient<{ campaigns: Campaign[] }>('/campaigns', { params }),
-  get: (id: string) => apiClient<{ campaign: Campaign }>(`/campaigns/${id}`),
+  list: (params?: { status?: string }) => apiClient<Campaign[]>('/campaigns', { params }),
+  get: (id: string) => apiClient<Campaign>(`/campaigns/${id}`),
   create: (data: CreateCampaignPayload) =>
     apiClient<{ campaign: Campaign; recipients: Recipient[] }>('/campaigns', {
       method: 'POST',

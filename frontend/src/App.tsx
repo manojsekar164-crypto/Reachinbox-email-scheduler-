@@ -55,7 +55,7 @@ export const App: React.FC = () => {
     try {
       setLoadingCampaigns(true);
       const res = await campaignApi.list();
-      setCampaigns(res.campaigns || []);
+      setCampaigns(Array.isArray(res) ? res : (res as any)?.campaigns || []);
     } catch (err: any) {
       error(err.message || 'Failed to fetch campaigns');
     } finally {
