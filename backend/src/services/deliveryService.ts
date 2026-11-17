@@ -6,6 +6,12 @@
  * Manages the canonical delivery state in `email_deliveries` and immutable audit
  * log in `email_attempts`. Implements PostgreSQL atomic delivery claiming using
  * `FOR UPDATE SKIP LOCKED` and `UPDATE ... RETURNING`.
+ *
+ * BATCH 3.2 ENHANCEMENTS:
+ *  - Removed automatic reclaiming of expired `sending` deliveries from `claimDelivery`.
+ *  - Added `reconcileStaleDeliveries` for safe, concurrent-safe stale claim reconciliation.
+ *  - Corrected `smtp_response_code` to store only genuine SMTP numeric codes (NULL otherwise).
+ *  - Network error codes (ECONNREFUSED, ETIMEDOUT) stored in `error_message` only.
  */
 
 import { Pool, PoolClient } from 'pg';
@@ -142,9 +148,13 @@ export async function ensureDeliveryRecord(
  *  1. Checks campaign status = 'sending' (campaign eligibility).
  *  2. Excludes soft-deleted deliveries (deleted_at IS NULL).
  *  3. Excludes already sent, failed, or uncertain (unknown) deliveries.
- *  4. Atomically updates status to 'sending', records claim_owner, claimed_at,
+ *  4. NEVER automatically reclaims an expired 'sending' delivery. An expired claim
+ *     with an unresolved 'attempting' record may have had its email accepted by the
+ *     SMTP server. Use `reconcileStaleDeliveries()` to safely transition stale
+ *     in-flight deliveries to 'unknown' for manual review.
+ *  5. Atomically updates status to 'sending', records claim_owner, claimed_at,
  *     lease_expires_at, and increments attempt_count.
- *  5. If multiple workers concurrently attempt to claim the exact same delivery,
+ *  6. If multiple workers concurrently attempt to claim the exact same delivery,
  *     exactly one worker acquires the row; the second worker skips it and receives null.
  */
 export async function claimDelivery(
@@ -171,7 +181,6 @@ export async function claimDelivery(
           ed.status = 'pending'
           OR (ed.status = 'retry_wait' AND (ed.next_attempt_at IS NULL OR ed.next_attempt_at <= NOW()))
           OR (ed.status = 'scheduled' AND (ed.scheduled_at IS NULL OR ed.scheduled_at <= NOW()))
-          OR (ed.status = 'sending' AND ed.lease_expires_at IS NOT NULL AND ed.lease_expires_at < NOW())
         )
       FOR UPDATE OF ed SKIP LOCKED
       LIMIT 1
@@ -351,8 +360,86 @@ export async function recordPostgresPersistenceFailure(
 }
 
 /**
+ * Helper: determines if a string is a genuine SMTP numeric response code (3-digit, 2xx-5xx).
+ * Returns the code if genuine, or null if it is a network error code (ECONNREFUSED, ETIMEDOUT, etc.).
+ */
+function extractGenuineSmtpCode(code: string | null | undefined): string | null {
+  if (!code) return null;
+  if (/^[2345]\d{2}$/.test(code)) return code;
+  return null;
+}
+
+/**
+ * Reconciles stale in-flight deliveries to 'unknown'.
+ *
+ * A delivery is "stale" if it is in 'sending' status with an expired lease and
+ * has an unresolved 'attempting' attempt record. This indicates that the original
+ * worker crashed or its database connection dropped before it could record the
+ * SMTP outcome. The email may or may not have been accepted by the SMTP server.
+ *
+ * Invariants:
+ *  1. Uses `FOR UPDATE SKIP LOCKED` to safely handle concurrent reconciliation workers.
+ *  2. Transitions delivery to 'unknown' (non-dispatchable, requires manual review).
+ *  3. Updates the corresponding 'attempting' record to 'unknown' with 'stale_claim_reconciliation'.
+ *  4. Clears claim_owner, lease_expires_at, and next_attempt_at.
+ *  5. Never automatically resends these deliveries.
+ *  6. Deliveries in 'sending' status WITHOUT an expired lease are left untouched
+ *     (they are still being actively processed by a live worker).
+ *
+ * Returns the number of stale deliveries reconciled.
+ */
+export async function reconcileStaleDeliveries(
+  client: Pool | PoolClient = defaultPool
+): Promise<{ reconciledCount: number; reconciledIds: string[] }> {
+  // Step 1: Atomically claim stale sending deliveries with expired leases
+  const staleResult = await client.query<EmailDeliveryRow>(
+    `WITH stale AS (
+       SELECT ed.id
+       FROM email_deliveries ed
+       WHERE ed.status = 'sending'
+         AND ed.lease_expires_at IS NOT NULL
+         AND ed.lease_expires_at < NOW()
+         AND ed.deleted_at IS NULL
+       FOR UPDATE OF ed SKIP LOCKED
+     )
+     UPDATE email_deliveries ed
+     SET status = 'unknown',
+         last_error = 'Stale claim reconciliation: delivery was in sending state with expired lease. SMTP outcome uncertain — requires manual review.',
+         claim_owner = NULL,
+         lease_expires_at = NULL,
+         next_attempt_at = NULL,
+         updated_at = NOW()
+     FROM stale
+     WHERE ed.id = stale.id
+     RETURNING ed.id;`
+  );
+
+  const reconciledIds = staleResult.rows.map((r) => r.id);
+
+  // Step 2: Update any unresolved 'attempting' records to 'unknown'
+  for (const deliveryId of reconciledIds) {
+    await client.query(
+      `UPDATE email_attempts
+       SET status = 'unknown',
+           error_classification = 'stale_claim_reconciliation',
+           error_message = 'Worker claim expired before SMTP outcome could be recorded. Delivery outcome is uncertain.',
+           completed_at = NOW()
+       WHERE delivery_id = $1
+         AND status = 'attempting';`,
+      [deliveryId]
+    );
+  }
+
+  return {
+    reconciledCount: reconciledIds.length,
+    reconciledIds,
+  };
+}
+
+/**
  * Records a permanent SMTP rejection in `email_attempts` and sets canonical delivery to terminal 'failed'.
  * Non-retryable: Prevents automated retry loops for 5xx errors or invalid credentials.
+ * Stores only genuine SMTP numeric response codes; network error codes are recorded in error_message only.
  */
 export async function recordAttemptPermanentRejection(
   deliveryId: string,
@@ -360,7 +447,7 @@ export async function recordAttemptPermanentRejection(
   error: { message?: string; responseCode?: string | null; errorDetail?: string },
   client: Pool | PoolClient = defaultPool
 ): Promise<void> {
-  const code = error.responseCode || '5xx';
+  const code = extractGenuineSmtpCode(error.responseCode);
   const desc = error.errorDetail || error.message || 'Permanent SMTP rejection';
 
   await client.query(
@@ -390,6 +477,7 @@ export async function recordAttemptPermanentRejection(
 /**
  * Records a transient SMTP rejection in `email_attempts`.
  * Sets canonical delivery to 'retry_wait' if attempts remain, otherwise to 'failed'.
+ * Stores only genuine SMTP numeric response codes; network error codes are recorded in error_message only.
  */
 export async function recordAttemptTransientRejection(
   deliveryId: string,
@@ -400,7 +488,7 @@ export async function recordAttemptTransientRejection(
   retryDelayMs = 5000,
   client: Pool | PoolClient = defaultPool
 ): Promise<void> {
-  const code = error.responseCode || '4xx';
+  const code = extractGenuineSmtpCode(error.responseCode);
   const desc = error.errorDetail || error.message || 'Transient SMTP rejection';
   const isFinal = attemptCount >= maxAttempts;
   const targetStatus: DeliveryStatus = isFinal ? 'failed' : 'retry_wait';
@@ -437,6 +525,7 @@ export async function recordAttemptTransientRejection(
 /**
  * Records a connection failure confirmed before message acceptance in `email_attempts`.
  * Sets canonical delivery to 'retry_wait' if attempts remain, otherwise to 'failed'.
+ * Network error codes (ECONNREFUSED, ETIMEDOUT) are stored in error_message, NOT smtp_response_code.
  */
 export async function recordAttemptConnectionFailure(
   deliveryId: string,
@@ -447,7 +536,7 @@ export async function recordAttemptConnectionFailure(
   retryDelayMs = 5000,
   client: Pool | PoolClient = defaultPool
 ): Promise<void> {
-  const code = error.responseCode || 'ECONNREFUSED';
+  const code = extractGenuineSmtpCode(error.responseCode);
   const desc = error.errorDetail || error.message || 'Connection failure before message acceptance';
   const isFinal = attemptCount >= maxAttempts;
   const targetStatus: DeliveryStatus = isFinal ? 'failed' : 'retry_wait';
@@ -484,6 +573,7 @@ export async function recordAttemptConnectionFailure(
 /**
  * Records an ambiguous SMTP delivery outcome in `email_attempts` and marks the canonical delivery as 'unknown'.
  * Sets terminal non-dispatchable 'unknown' state without automatic retry.
+ * Network error codes (ETIMEDOUT, ECONNRESET) are stored in error_message, NOT smtp_response_code.
  */
 export async function recordAttemptAmbiguousOutcome(
   deliveryId: string,
@@ -491,7 +581,7 @@ export async function recordAttemptAmbiguousOutcome(
   error: { message?: string; responseCode?: string | null; errorDetail?: string },
   client: Pool | PoolClient = defaultPool
 ): Promise<void> {
-  const code = error.responseCode || 'ETIMEDOUT';
+  const code = extractGenuineSmtpCode(error.responseCode);
   const desc = error.errorDetail
     ? `Uncertain SMTP delivery outcome: ${error.errorDetail}`
     : `Uncertain SMTP delivery outcome: ${error.message || 'Connection lost during or after DATA transmission'}`;

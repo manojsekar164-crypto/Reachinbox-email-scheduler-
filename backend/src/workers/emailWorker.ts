@@ -21,6 +21,7 @@ import {
   recordAttemptConnectionFailure,
   recordAttemptAmbiguousOutcome,
   recordPostgresPersistenceFailure,
+  reconcileStaleDeliveries,
   classifySmtpOutcome,
   isUncertainSmtpError,
   activateDueCampaign,

@@ -480,3 +480,58 @@ Awaiting explicit operator authorization.
 | Phase 1 Database Test | `npm run phase1:test` | ✅ PASS | 16/16 assertions passed |
 | TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
 | Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched (6 baseline tables) |
+
+
+---
+
+## [Entry 009] - 2026-11-17 - Phase 1 Batch 3.2: Stale Claim Safety and SMTP Metadata
+
+**Scope:** Batch 3.2 – Stale Claim Safety and SMTP Metadata
+**Branch:** `feat/database-foundation`
+**Starting Baseline Commit:** `2cdc32c32cf97b973ec1bba7d3a0eeb9b25a2df6`
+**Engineer:** Senior Backend Engineer
+
+### Implementation Summary
+
+1. **Prevent Duplicate Sends After PostgreSQL Outage (`src/services/deliveryService.ts`, `src/workers/emailWorker.ts`):**
+   - **Eliminated Expired `sending` Reclaim Invariant:** Removed the clause `OR (ed.status = 'sending' AND ed.lease_expires_at IS NOT NULL AND ed.lease_expires_at < NOW())` from `claimDelivery()`. Stale in-flight deliveries are never automatically reclaimed by standard worker claiming.
+   - **Safe Stale Claim Reconciliation (`reconcileStaleDeliveries`):** Implemented dedicated reconciliation using `FOR UPDATE SKIP LOCKED`. Atomically identifies deliveries in `sending` status with expired leases (`lease_expires_at < NOW()`) and transitions them to `unknown` (non-dispatchable, requiring manual review).
+   - **Attempt History Reconciliation:** Transitions any lingering `attempting` records for those deliveries to `unknown` with `error_classification = 'stale_claim_reconciliation'`, preserving full audit context.
+   - **Lease and Claim Cleanup:** Clears `claim_owner`, `lease_expires_at`, and `next_attempt_at` on reconciled deliveries.
+   - **Multi-Worker Concurrency Safety:** Safe across concurrent worker runs and server restarts; live in-flight deliveries with active leases are strictly untouched.
+
+2. **Correct SMTP Response-Code Metadata (`src/services/deliveryService.ts`):**
+   - **Numeric SMTP Code Invariant:** Added `extractGenuineSmtpCode()` ensuring `smtp_response_code` stores ONLY authentic 3-digit numeric SMTP response codes (`/^[2345]\d{2}$/`).
+   - **Elimination of Non-SMTP Strings:** Completely eliminated storing pseudo-codes such as `'5xx'`, `'4xx'`, and network error codes `'ECONNREFUSED'`, `'ETIMEDOUT'`, or `'ECONNRESET'` in `smtp_response_code`.
+   - **Diagnostic Separation:** Network error codes and detailed diagnostic failure contexts are stored strictly in `error_message` and `error_classification`.
+   - **NULL When Unavailable:** When an actual SMTP response code is unavailable (e.g. network connection dropped before server response or during handshake), `smtp_response_code` is stored strictly as `NULL`.
+
+3. **Acceptance & Regression Tests (`src/scripts/testBatch3SmtpReliability.ts`):**
+   - **Scenario 13:** Stale claim reconciliation after PostgreSQL outage:
+     - Simulates SMTP acceptance followed by database persistence failure.
+     - Simulates worker crash leaving delivery in `sending` with expired lease and attempt in `attempting`.
+     - Executes `reconcileStaleDeliveries()`; verifies delivery becomes `unknown`, not `pending` or `sending`.
+     - Verifies claim owner and lease expiry are cleared.
+     - Verifies attempt status becomes `unknown` with `stale_claim_reconciliation`.
+     - Verifies subsequent worker cannot claim or resend (returns `null`, skips job).
+     - Verifies SMTP test server received exactly 1 submission (zero duplicate sends).
+   - **Scenario 14:** SMTP response code metadata correctness:
+     - Verifies genuine SMTP codes (535, 451, 550, 250) are preserved.
+     - Verifies missing response codes remain `NULL` on connection and ambiguous failures.
+     - Verifies network error codes (ECONNREFUSED, ETIMEDOUT) are stored in `error_message`, never in `smtp_response_code`.
+   - **Full Regression Verification:**
+     - Batch 3: 95/95 assertions passed across 14 scenarios.
+     - Batch 2: 25/25 assertions passed across 9 scenarios.
+     - Batch 1: 24/24 assertions passed across 5 scenarios.
+     - TypeScript Build: 0 errors.
+     - Production DB `reachinbox`: 100% untouched.
+
+### Actual Test Results
+
+| Test Suite | Command | Result | Notes |
+|---|---|---|---|
+| Batch 3 Verification Suite | `npm run batch3:test` | ✅ PASS | 95/95 assertions passed across all 14 scenarios (including Scenarios 13 and 14) |
+| Batch 2 Verification Suite | `npm run batch2:test` | ✅ PASS | 25/25 assertions passed across all 9 outbox/persistence scenarios |
+| Batch 1 Verification Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
+| TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
+| Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched (6 baseline tables) |

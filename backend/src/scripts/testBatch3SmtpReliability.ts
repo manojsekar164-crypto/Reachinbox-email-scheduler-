@@ -4,8 +4,9 @@
  * REACHINBOX — BATCH 3 ACCEPTANCE TEST SUITE
  * SMTP Reliability and Sender Identity Verification
  *
- * Verifies all 10 Batch 3 acceptance criteria against an isolated ephemeral PostgreSQL
- * database and a deterministic in-process RFC 5321 SMTP test server:
+ * Verifies all 10 Batch 3 acceptance criteria plus Batch 3.1 and 3.2 scenarios
+ * against an isolated ephemeral PostgreSQL database and a deterministic in-process
+ * RFC 5321 SMTP test server:
  *
  *  1. Explicitly selected sender fails authentication: no default sender fallback.
  *  2. Explicitly selected sender fails to connect: no sender switching.
@@ -38,7 +39,7 @@ import path from 'path';
 import nodemailer from 'nodemailer';
 import { runMigrations } from '../db/migrate';
 import { processEmailJob } from '../workers/emailWorker';
-import { getDelivery, claimDelivery } from '../services/deliveryService';
+import { getDelivery, claimDelivery, reconcileStaleDeliveries } from '../services/deliveryService';
 import { clearTransporterCache, setDefaultTransporter, resetDefaultTransporter } from '../services/emailService';
 import { safeEncrypt } from '../utils/crypto';
 
@@ -952,6 +953,200 @@ async function runBatch3Verification(): Promise<void> {
         [d11!.id]
       );
       assert(parseInt(a12Count.rows[0].cnt, 10) === 1, 'ZERO new attempts created (attempt_count remains 1)');
+
+      // ======================================================================
+      // SCENARIO 13: Stale claim reconciliation after PostgreSQL outage (Batch 3.2 Bug 1)
+      //   Tests 1-6: SMTP acceptance → DB outage → lease expires → reconciliation → verify unknown
+      // ======================================================================
+      console.log('\n' + SUB_SEP);
+      console.log('SCENARIO 13: Stale claim reconciliation after PostgreSQL outage');
+      console.log(SUB_SEP);
+
+      clearTransporterCache();
+      smtpControl.mode = 'normal';
+      const staleMsgId = '<stale-claim-accepted-321@reachinbox.test>';
+      smtpControl.assignedMessageId = staleMsgId;
+      smtpControl.sessions = [];
+
+      const sender13Id = await createTestSender('Sender Stale', 'stale@sender.test', 'user_stale', 'pass');
+      const c13 = await testClient.query(`
+        INSERT INTO campaigns (user_id, sender_id, subject, body, status)
+        VALUES ($1, $2, 'Stale Claim Test', 'Body', 'sending') RETURNING id;
+      `, [userId, sender13Id]);
+      const c13Id = c13.rows[0].id;
+      const r13Id = await createTestRecip(c13Id, 'stale_recip@reachinbox.test');
+
+      // Step 1: Simulate SMTP acceptance followed by DB persistence failure
+      let c13Thrown = false;
+      try {
+        await processEmailJob(
+          {
+            id: `job_scenario_13_${c13Id}`,
+            data: {
+              campaignId: c13Id,
+              recipientId: r13Id,
+              simulateDbFailureAfterSend: true,
+            },
+            attemptsMade: 0,
+          },
+          testPool
+        );
+      } catch {
+        c13Thrown = true;
+      }
+      assert(!c13Thrown, 'Worker does NOT rethrow on post-acceptance DB failure');
+
+      // Count initial SMTP sends (should be exactly 1)
+      const staleSmtpCount1 = smtpControl.sessions.filter(
+        (s) => s.rcptTo?.includes('stale_recip@reachinbox.test') && s.dataLines?.length > 0
+      ).length;
+      assert(staleSmtpCount1 === 1, 'SMTP server received exactly one submission');
+
+      // Delivery should already be 'unknown' from recordPostgresPersistenceFailure
+      const d13a = await getDelivery(c13Id, r13Id, testClient);
+      assert(d13a!.status === 'unknown', 'Delivery is in non-dispatchable \"unknown\" state after DB persistence failure');
+
+      // Step 2: Simulate a scenario where delivery stayed in 'sending' (the more dangerous case):
+      // Directly put delivery back to 'sending' with an EXPIRED lease to simulate a crash
+      // where recordPostgresPersistenceFailure never executed
+      await testClient.query(
+        `UPDATE email_deliveries
+         SET status = 'sending',
+             claim_owner = 'crashed_worker_1234',
+             lease_expires_at = NOW() - INTERVAL '5 minutes',
+             last_error = NULL,
+             updated_at = NOW()
+         WHERE id = $1`,
+        [d13a!.id]
+      );
+      // Also put the attempt back to 'attempting' to simulate the crash scenario
+      await testClient.query(
+        `UPDATE email_attempts
+         SET status = 'attempting',
+             error_classification = NULL,
+             error_message = NULL,
+             completed_at = NULL
+         WHERE delivery_id = $1`,
+        [d13a!.id]
+      );
+
+      // Step 3: Run stale-delivery reconciliation
+      console.log('   Running stale claim reconciliation...');
+      const reconResult = await reconcileStaleDeliveries(testPool);
+      assert(reconResult.reconciledCount >= 1, 'Reconciliation found and processed stale delivery');
+      assert(reconResult.reconciledIds.includes(d13a!.id), 'Stale delivery ID included in reconciled set');
+
+      // Step 4: Verify delivery is now 'unknown', NOT 'pending' or 'sending'
+      const d13b = await getDelivery(c13Id, r13Id, testClient);
+      assert(d13b!.status === 'unknown', 'Delivery transitioned to \"unknown\" (not pending or sending) after reconciliation');
+      assert(d13b!.claim_owner === null, 'Claim owner cleared by reconciliation');
+      assert(d13b!.lease_expires_at === null, 'Lease expiry cleared by reconciliation');
+      assert(
+        d13b!.last_error !== null && d13b!.last_error.includes('Stale claim reconciliation'),
+        'Last error records reconciliation context'
+      );
+
+      // Verify attempt record updated
+      const a13 = await testClient.query(
+        `SELECT * FROM email_attempts WHERE delivery_id = $1 ORDER BY attempt_number DESC LIMIT 1;`,
+        [d13a!.id]
+      );
+      assert(a13.rows[0].status === 'unknown', 'Attempt transitioned to \"unknown\" by reconciliation');
+      assert(a13.rows[0].error_classification === 'stale_claim_reconciliation', 'Classification is \"stale_claim_reconciliation\"');
+
+      // Step 5: Verify a second worker cannot claim or resend
+      const staleClaim = await claimDelivery({
+        campaignId: c13Id,
+        recipientId: r13Id,
+        claimOwner: 'worker_post_reconciliation',
+        leaseDurationMs: 60000,
+        dbClient: testClient,
+      });
+      assert(staleClaim === null, 'Post-reconciliation claim returns NULL (delivery is non-dispatchable)');
+
+      // Also verify processEmailJob skips it
+      await processEmailJob(
+        {
+          id: `job_scenario_13_retry_${c13Id}`,
+          data: { campaignId: c13Id, recipientId: r13Id },
+          attemptsMade: 1,
+        },
+        testPool
+      );
+      const d13c = await getDelivery(c13Id, r13Id, testClient);
+      assert(d13c!.status === 'unknown', 'Worker skips \"unknown\" delivery (never resent)');
+
+      // Step 6: Verify SMTP server received exactly one submission (zero duplicates)
+      const staleSmtpCount2 = smtpControl.sessions.filter(
+        (s) => s.rcptTo?.includes('stale_recip@reachinbox.test') && s.dataLines?.length > 0
+      ).length;
+      assert(staleSmtpCount2 === 1, 'SMTP received exactly one submission total (zero duplicates after reconciliation)');
+
+      // ======================================================================
+      // SCENARIO 14: SMTP response code metadata correctness (Batch 3.2 Bug 2)
+      //   Tests 7-9: genuine codes preserved, missing codes = NULL, network errors outside smtp_response_code
+      // ======================================================================
+      console.log('\n' + SUB_SEP);
+      console.log('SCENARIO 14: SMTP response code metadata correctness');
+      console.log(SUB_SEP);
+
+      // Test 7: Actual SMTP response codes are preserved
+      // Re-verify Scenario 1 (auth failure = 535), Scenario 4 (transient = 451), Scenario 5 (perm = 550)
+      const s1a = await testClient.query(`SELECT smtp_response_code FROM email_attempts WHERE delivery_id = $1`, [d1!.id]);
+      assert(s1a.rows[0].smtp_response_code === '535', 'Genuine SMTP code 535 preserved for auth failure');
+
+      const s4a = await testClient.query(`SELECT smtp_response_code FROM email_attempts WHERE delivery_id = $1`, [d4!.id]);
+      assert(s4a.rows[0].smtp_response_code === '451', 'Genuine SMTP code 451 preserved for transient rejection');
+
+      const s5a = await testClient.query(`SELECT smtp_response_code FROM email_attempts WHERE delivery_id = $1`, [d5!.id]);
+      assert(s5a.rows[0].smtp_response_code === '550', 'Genuine SMTP code 550 preserved for permanent rejection');
+
+      const s8a = await testClient.query(`SELECT smtp_response_code FROM email_attempts WHERE delivery_id = $1`, [d8!.id]);
+      assert(s8a.rows[0].smtp_response_code === '250', 'Genuine SMTP code 250 preserved for confirmed acceptance');
+
+      // Test 8: Missing response codes remain NULL
+      // Scenario 8b already verifies this for successful sends; also check connection failures and ambiguous outcomes
+      const s6a = await testClient.query(`SELECT smtp_response_code, error_classification, error_message FROM email_attempts WHERE delivery_id = $1`, [d6!.id]);
+      assert(
+        s6a.rows[0].smtp_response_code === null,
+        'Connection failure stores NULL smtp_response_code (not ECONNREFUSED)'
+      );
+
+      const s7a = await testClient.query(`SELECT smtp_response_code, error_classification, error_message FROM email_attempts WHERE delivery_id = $1`, [d7!.id]);
+      assert(
+        s7a.rows[0].smtp_response_code === null,
+        'Ambiguous outcome stores NULL smtp_response_code (not ETIMEDOUT)'
+      );
+
+      // Test 9: Network error codes stored in error_message, not smtp_response_code
+      assert(
+        s6a.rows[0].error_message !== null && s6a.rows[0].error_message.length > 0,
+        'Connection failure error details stored in error_message field'
+      );
+      assert(
+        s6a.rows[0].error_classification === 'connection_failure',
+        'Connection failure classification preserved in error_classification'
+      );
+
+      assert(
+        s7a.rows[0].error_message !== null && s7a.rows[0].error_message.length > 0,
+        'Ambiguous outcome error details stored in error_message field'
+      );
+      assert(
+        s7a.rows[0].error_classification === 'ambiguous_outcome',
+        'Ambiguous outcome classification preserved in error_classification'
+      );
+
+      // Verify Scenario 2 (ECONNREFUSED on connection) also stores NULL smtp_response_code
+      const s2a = await testClient.query(`SELECT smtp_response_code, error_message FROM email_attempts WHERE delivery_id = $1`, [d2!.id]);
+      assert(
+        s2a.rows[0].smtp_response_code === null,
+        'ECONNREFUSED connection failure stores NULL smtp_response_code (not network error code)'
+      );
+      assert(
+        s2a.rows[0].error_message !== null && s2a.rows[0].error_message.includes('Connection failure'),
+        'ECONNREFUSED details stored in error_message'
+      );
 
     } finally {
       resetDefaultTransporter();
