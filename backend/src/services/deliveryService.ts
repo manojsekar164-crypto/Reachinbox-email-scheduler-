@@ -11,6 +11,19 @@
 import { Pool, PoolClient } from 'pg';
 import { db as defaultPool } from '../db/postgres';
 import { EmailDeliveryRow, DeliveryStatus } from '../types/db.types';
+import {
+  classifySmtpOutcome,
+  isUncertainSmtpError,
+  SmtpOutcomeCategory,
+  SmtpClassificationResult,
+} from './smtpClassifier';
+
+export {
+  classifySmtpOutcome,
+  isUncertainSmtpError,
+  SmtpOutcomeCategory,
+  SmtpClassificationResult,
+};
 
 export interface ClaimDeliveryOptions {
   campaignId: string;
@@ -32,38 +45,6 @@ export interface UncertainErrorCheck {
   message?: string;
   code?: string;
   isUncertain?: boolean;
-}
-
-/**
- * Detects whether an SMTP error represents an uncertain outcome (in-doubt delivery).
- * In an uncertain delivery, the client cannot verify if the remote SMTP server
- * accepted and queued/delivered the message before the connection was severed.
- * Such deliveries MUST NOT be blindly retried.
- */
-export function isUncertainSmtpError(error: any): boolean {
-  if (!error) return false;
-  if (error.isUncertain === true) return true;
-
-  const code = (error.code || '').toUpperCase();
-  const msg = (error.message || '').toLowerCase();
-
-  const uncertainCodes = ['ECONNRESET', 'ETIMEDOUT', 'ESOCKETTIMEDOUT', 'EPIPE'];
-  if (uncertainCodes.includes(code)) {
-    return true;
-  }
-
-  const uncertainSubstrings = [
-    'timeout',
-    'socket hung up',
-    'connection lost',
-    'connection reset',
-    'broken pipe',
-    'in-doubt',
-    'uncertain',
-    'timed out',
-  ];
-
-  return uncertainSubstrings.some((sub) => msg.includes(sub));
 }
 
 /**
@@ -269,21 +250,27 @@ export async function recordAttemptStart(
 
 /**
  * Records a successful delivery outcome in `email_attempts` and marks the canonical delivery as 'sent'.
+ * Stores genuine SMTP message ID and confirmed acceptance classification.
  */
 export async function recordAttemptSuccess(
   deliveryId: string,
   attemptId: string,
   smtpMessageId: string | null,
-  client: Pool | PoolClient = defaultPool
+  client: Pool | PoolClient = defaultPool,
+  smtpResponseCode: string | null = '250'
 ): Promise<void> {
+  const code = smtpResponseCode || '250';
+
   // Update attempt history
   await client.query(
     `UPDATE email_attempts
      SET status = 'sent',
          smtp_message_id = $1,
+         smtp_response_code = $2,
+         error_classification = 'confirmed_acceptance',
          completed_at = NOW()
-     WHERE id = $2`,
-    [smtpMessageId, attemptId]
+     WHERE id = $3`,
+    [smtpMessageId, code, attemptId]
   );
 
   // Update canonical delivery
@@ -295,6 +282,7 @@ export async function recordAttemptSuccess(
          last_error = NULL,
          claim_owner = NULL,
          lease_expires_at = NULL,
+         next_attempt_at = NULL,
          updated_at = NOW()
      WHERE id = $2`,
     [smtpMessageId, deliveryId]
@@ -302,30 +290,164 @@ export async function recordAttemptSuccess(
 }
 
 /**
- * Records an uncertain delivery outcome.
- * Marks both the attempt and canonical delivery as 'unknown'.
- * Clears claim lease so it is not locked, but leaves it in non-dispatchable 'unknown' state.
+ * Records a permanent SMTP rejection in `email_attempts` and sets canonical delivery to terminal 'failed'.
+ * Non-retryable: Prevents automated retry loops for 5xx errors or invalid credentials.
  */
-export async function recordAttemptUncertain(
+export async function recordAttemptPermanentRejection(
   deliveryId: string,
   attemptId: string,
-  error: { message: string; code?: string },
+  error: { message?: string; responseCode?: string | null; errorDetail?: string },
   client: Pool | PoolClient = defaultPool
 ): Promise<void> {
-  const errorMsg = `Uncertain SMTP delivery outcome: ${error.message || 'Connection lost during dispatch'}`;
+  const code = error.responseCode || '5xx';
+  const desc = error.errorDetail || error.message || 'Permanent SMTP rejection';
+
+  await client.query(
+    `UPDATE email_attempts
+     SET status = 'failed',
+         smtp_response_code = $1,
+         error_classification = 'permanent_rejection',
+         error_message = $2,
+         completed_at = NOW()
+     WHERE id = $3`,
+    [code, desc, attemptId]
+  );
+
+  await client.query(
+    `UPDATE email_deliveries
+     SET status = 'failed',
+         last_error = $1,
+         claim_owner = NULL,
+         lease_expires_at = NULL,
+         next_attempt_at = NULL,
+         updated_at = NOW()
+     WHERE id = $2`,
+    [desc, deliveryId]
+  );
+}
+
+/**
+ * Records a transient SMTP rejection in `email_attempts`.
+ * Sets canonical delivery to 'retry_wait' if attempts remain, otherwise to 'failed'.
+ */
+export async function recordAttemptTransientRejection(
+  deliveryId: string,
+  attemptId: string,
+  error: { message?: string; responseCode?: string | null; errorDetail?: string },
+  attemptCount: number,
+  maxAttempts = 3,
+  retryDelayMs = 5000,
+  client: Pool | PoolClient = defaultPool
+): Promise<void> {
+  const code = error.responseCode || '4xx';
+  const desc = error.errorDetail || error.message || 'Transient SMTP rejection';
+  const isFinal = attemptCount >= maxAttempts;
+  const targetStatus: DeliveryStatus = isFinal ? 'failed' : 'retry_wait';
+
+  await client.query(
+    `UPDATE email_attempts
+     SET status = 'failed',
+         smtp_response_code = $1,
+         error_classification = 'transient_rejection',
+         error_message = $2,
+         completed_at = NOW()
+     WHERE id = $3`,
+    [code, desc, attemptId]
+  );
+
+  const nextAttemptClause =
+    targetStatus === 'retry_wait' && retryDelayMs > 0
+      ? `NOW() + (${Number(retryDelayMs)} || ' milliseconds')::INTERVAL`
+      : 'NULL';
+
+  await client.query(
+    `UPDATE email_deliveries
+     SET status = $1,
+         last_error = $2,
+         claim_owner = NULL,
+         lease_expires_at = NULL,
+         next_attempt_at = ${nextAttemptClause},
+         updated_at = NOW()
+     WHERE id = $3`,
+    [targetStatus, desc, deliveryId]
+  );
+}
+
+/**
+ * Records a connection failure confirmed before message acceptance in `email_attempts`.
+ * Sets canonical delivery to 'retry_wait' if attempts remain, otherwise to 'failed'.
+ */
+export async function recordAttemptConnectionFailure(
+  deliveryId: string,
+  attemptId: string,
+  error: { message?: string; responseCode?: string | null; errorDetail?: string },
+  attemptCount: number,
+  maxAttempts = 3,
+  retryDelayMs = 5000,
+  client: Pool | PoolClient = defaultPool
+): Promise<void> {
+  const code = error.responseCode || 'ECONNREFUSED';
+  const desc = error.errorDetail || error.message || 'Connection failure before message acceptance';
+  const isFinal = attemptCount >= maxAttempts;
+  const targetStatus: DeliveryStatus = isFinal ? 'failed' : 'retry_wait';
+
+  await client.query(
+    `UPDATE email_attempts
+     SET status = 'failed',
+         smtp_response_code = $1,
+         error_classification = 'connection_failure',
+         error_message = $2,
+         completed_at = NOW()
+     WHERE id = $3`,
+    [code, desc, attemptId]
+  );
+
+  const nextAttemptClause =
+    targetStatus === 'retry_wait' && retryDelayMs > 0
+      ? `NOW() + (${Number(retryDelayMs)} || ' milliseconds')::INTERVAL`
+      : 'NULL';
+
+  await client.query(
+    `UPDATE email_deliveries
+     SET status = $1,
+         last_error = $2,
+         claim_owner = NULL,
+         lease_expires_at = NULL,
+         next_attempt_at = ${nextAttemptClause},
+         updated_at = NOW()
+     WHERE id = $3`,
+    [targetStatus, desc, deliveryId]
+  );
+}
+
+/**
+ * Records an ambiguous SMTP delivery outcome in `email_attempts` and marks the canonical delivery as 'unknown'.
+ * Sets terminal non-dispatchable 'unknown' state without automatic retry.
+ */
+export async function recordAttemptAmbiguousOutcome(
+  deliveryId: string,
+  attemptId: string,
+  error: { message?: string; responseCode?: string | null; errorDetail?: string },
+  client: Pool | PoolClient = defaultPool
+): Promise<void> {
+  const code = error.responseCode || 'ETIMEDOUT';
+  const desc = error.errorDetail
+    ? `Uncertain SMTP delivery outcome: ${error.errorDetail}`
+    : `Uncertain SMTP delivery outcome: ${error.message || 'Connection lost during or after DATA transmission'}`;
 
   // Update attempt history
   await client.query(
     `UPDATE email_attempts
      SET status = 'unknown',
          smtp_response_code = $1,
+         error_classification = 'ambiguous_outcome',
          error_message = $2,
          completed_at = NOW()
      WHERE id = $3`,
-    [error.code || null, errorMsg, attemptId]
+    [code, desc, attemptId]
   );
 
-  // Update canonical delivery to terminal 'unknown'
+  // Update canonical delivery to terminal 'unknown' (never retried)
   await client.query(
     `UPDATE email_deliveries
      SET status = 'unknown',
@@ -335,13 +457,29 @@ export async function recordAttemptUncertain(
          next_attempt_at = NULL,
          updated_at = NOW()
      WHERE id = $2`,
-    [errorMsg, deliveryId]
+    [desc, deliveryId]
   );
 }
 
 /**
- * Records a definite failure in `email_attempts` and updates the canonical delivery.
- * If retries remain, sets status to 'retry_wait'; otherwise sets status to 'failed'.
+ * Backward-compatible helper for uncertain outcomes. Delegates to recordAttemptAmbiguousOutcome.
+ */
+export async function recordAttemptUncertain(
+  deliveryId: string,
+  attemptId: string,
+  error: { message: string; code?: string },
+  client: Pool | PoolClient = defaultPool
+): Promise<void> {
+  return recordAttemptAmbiguousOutcome(
+    deliveryId,
+    attemptId,
+    { message: error.message, responseCode: error.code },
+    client
+  );
+}
+
+/**
+ * Backward-compatible helper for definite failure. Classifies outcome and delegates accordingly.
  */
 export async function recordAttemptFailure(
   deliveryId: string,
@@ -352,35 +490,40 @@ export async function recordAttemptFailure(
   retryDelayMs = 5000,
   client: Pool | PoolClient = defaultPool
 ): Promise<void> {
-  const isFinal = attemptCount >= maxAttempts;
-  const targetStatus: DeliveryStatus = isFinal ? 'failed' : 'retry_wait';
-
-  // Update attempt history
-  await client.query(
-    `UPDATE email_attempts
-     SET status = 'failed',
-         smtp_response_code = $1,
-         error_message = $2,
-         completed_at = NOW()
-     WHERE id = $3`,
-    [error.code || null, error.message || 'SMTP dispatch failed', attemptId]
-  );
-
-  const nextAttemptClause =
-    targetStatus === 'retry_wait' && retryDelayMs > 0
-      ? `NOW() + (${Number(retryDelayMs)} || ' milliseconds')::INTERVAL`
-      : 'NULL';
-
-  // Update canonical delivery
-  await client.query(
-    `UPDATE email_deliveries
-     SET status = $1,
-         last_error = $2,
-         claim_owner = NULL,
-         lease_expires_at = NULL,
-         next_attempt_at = ${nextAttemptClause},
-         updated_at = NOW()
-     WHERE id = $3`,
-    [targetStatus, error.message || 'SMTP dispatch failed', deliveryId]
-  );
+  const classification = classifySmtpOutcome(error);
+  if (classification.category === 'permanent_rejection') {
+    return recordAttemptPermanentRejection(
+      deliveryId,
+      attemptId,
+      { message: error.message, responseCode: classification.responseCode, errorDetail: classification.errorDetail },
+      client
+    );
+  } else if (classification.category === 'transient_rejection') {
+    return recordAttemptTransientRejection(
+      deliveryId,
+      attemptId,
+      { message: error.message, responseCode: classification.responseCode, errorDetail: classification.errorDetail },
+      attemptCount,
+      maxAttempts,
+      retryDelayMs,
+      client
+    );
+  } else if (classification.category === 'ambiguous_outcome') {
+    return recordAttemptAmbiguousOutcome(
+      deliveryId,
+      attemptId,
+      { message: error.message, responseCode: classification.responseCode, errorDetail: classification.errorDetail },
+      client
+    );
+  } else {
+    return recordAttemptConnectionFailure(
+      deliveryId,
+      attemptId,
+      { message: error.message, responseCode: classification.responseCode, errorDetail: classification.errorDetail },
+      attemptCount,
+      maxAttempts,
+      retryDelayMs,
+      client
+    );
+  }
 }

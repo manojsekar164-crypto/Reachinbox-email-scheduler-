@@ -16,8 +16,11 @@ import {
   releaseDeliveryClaim,
   recordAttemptStart,
   recordAttemptSuccess,
-  recordAttemptFailure,
-  recordAttemptUncertain,
+  recordAttemptPermanentRejection,
+  recordAttemptTransientRejection,
+  recordAttemptConnectionFailure,
+  recordAttemptAmbiguousOutcome,
+  classifySmtpOutcome,
   isUncertainSmtpError,
   activateDueCampaign,
 } from '../services/deliveryService';
@@ -288,10 +291,15 @@ export async function processEmailJob(
       html: bodyHtml,
     });
 
-    console.log(`   ✅ [Job ${jobId}] Email sent successfully! MessageId: ${result.messageId}`);
+    // Extract genuine server message ID from SMTP response (e.g. queued as <...>) or client Message-ID
+    const queuedAsMatch = result.response ? result.response.match(/queued as\s+(<[^>\s]+>|[^\s]+)/i) : null;
+    const genuineMessageId = queuedAsMatch ? queuedAsMatch[1] : result.messageId;
 
-    // Update canonical delivery and attempt to 'sent'
-    await recordAttemptSuccess(claimedDelivery.id, attemptId, result.messageId, dbClient);
+    console.log(`   ✅ [Job ${jobId}] Email accepted by SMTP server! MessageId: ${genuineMessageId}`);
+
+    // Update canonical delivery and attempt to 'sent' with genuine messageId and response code
+    const responseCode = result.response ? (result.response.match(/\b([245]\d{2})\b/)?.[1] || '250') : '250';
+    await recordAttemptSuccess(claimedDelivery.id, attemptId, genuineMessageId, dbClient, responseCode);
 
     // Record Success in historical email_logs
     await dbClient.query(
@@ -335,42 +343,85 @@ export async function processEmailJob(
       console.warn(`⚠️ [Campaign ${campaignId}] Could not update status: ${statusErr.message}`);
     }
   } catch (error: any) {
-    const safeErrorDescription = error.message || 'Unknown SMTP error';
+    const classification = classifySmtpOutcome(error);
+    const safeErrorDescription = classification.errorDetail || error.message || 'Unknown SMTP error';
 
-    // Invariant: Never automatically retry an uncertain SMTP outcome
-    if (isUncertainSmtpError(error)) {
+    // Outcome Category 5: Ambiguous SMTP outcome (connection lost or timeout during/after DATA)
+    // Invariant: Never automatically retry an ambiguous (unknown) delivery
+    if (classification.category === 'ambiguous_outcome') {
       console.error(
-        `   ⚠️ [Job ${jobId}] Uncertain SMTP outcome detected (${safeErrorDescription}). Marking as 'unknown'. Never blindly resending.`
+        `   ⚠️ [Job ${jobId}] Ambiguous SMTP outcome detected (${safeErrorDescription}). Marking as 'unknown'. Never blindly resending.`
       );
 
-      await recordAttemptUncertain(
+      await recordAttemptAmbiguousOutcome(
         claimedDelivery.id,
         attemptId,
-        { message: safeErrorDescription, code: error.code },
+        classification,
         dbClient
       );
 
       // Record in historical email_logs as failed with uncertain detail
       await dbClient.query(
         "INSERT INTO email_logs (campaign_id, recipient_id, sender_id, status, error_message, sent_at) VALUES ($1, $2, $3, 'failed', $4, NULL)",
-        [campaignId, recipientId, campaign.sender_id || null, `Uncertain outcome: ${safeErrorDescription}`]
+        [campaignId, recipientId, campaign.sender_id || null, `Ambiguous outcome: ${safeErrorDescription}`]
       );
 
       // Complete job cleanly WITHOUT rethrowing to prevent BullMQ from auto-retrying
       return;
     }
 
-    // Definite failure: Record attempt and update canonical delivery
+    // Outcome Category 2: Definitive permanent rejection (5xx or auth failure)
+    // Invariant: Non-retryable. Never automatically retry a permanent failure with identical parameters.
+    if (classification.category === 'permanent_rejection') {
+      console.error(
+        `   ❌ [Job ${jobId}] Permanent SMTP rejection (${classification.responseCode || '5xx'}): ${safeErrorDescription}. Delivery marked 'failed'. Will not retry.`
+      );
+
+      await recordAttemptPermanentRejection(
+        claimedDelivery.id,
+        attemptId,
+        classification,
+        dbClient
+      );
+
+      await dbClient.query(
+        "INSERT INTO email_logs (campaign_id, recipient_id, sender_id, status, error_message, sent_at) VALUES ($1, $2, $3, 'failed', $4, NULL)",
+        [campaignId, recipientId, campaign.sender_id || null, `Permanent rejection: ${safeErrorDescription}`]
+      );
+
+      // Complete job cleanly WITHOUT rethrowing so BullMQ does not repeat permanent failures
+      return;
+    }
+
+    // Outcome Categories 3 & 4: Transient rejection (4xx) or Connection failure confirmed before message acceptance
+    // Invariant: Only retry failures confirmed to have occurred before SMTP acceptance
     const maxAttempts = job.opts?.attempts || 3;
-    await recordAttemptFailure(
-      claimedDelivery.id,
-      attemptId,
-      { message: safeErrorDescription, code: error.code },
-      claimedDelivery.attempt_count,
-      maxAttempts,
-      5000,
-      dbClient
+    const isTransient = classification.category === 'transient_rejection';
+    console.log(
+      `   ⏳ [Job ${jobId}] ${isTransient ? 'Transient SMTP rejection' : 'Connection failure before message acceptance'} (${safeErrorDescription}). Safe to retry.`
     );
+
+    if (isTransient) {
+      await recordAttemptTransientRejection(
+        claimedDelivery.id,
+        attemptId,
+        classification,
+        claimedDelivery.attempt_count,
+        maxAttempts,
+        5000,
+        dbClient
+      );
+    } else {
+      await recordAttemptConnectionFailure(
+        claimedDelivery.id,
+        attemptId,
+        classification,
+        claimedDelivery.attempt_count,
+        maxAttempts,
+        5000,
+        dbClient
+      );
+    }
 
     // Record in historical email_logs
     await dbClient.query(
@@ -378,7 +429,7 @@ export async function processEmailJob(
       [campaignId, recipientId, campaign.sender_id || null, safeErrorDescription]
     );
 
-    console.log(`   ⏳ [Job ${jobId}] Definite failure recorded. Rethrowing for BullMQ exponential backoff...`);
+    // Rethrow error so BullMQ can schedule exponential backoff retry for transient/connection failures
     throw error;
   }
 }

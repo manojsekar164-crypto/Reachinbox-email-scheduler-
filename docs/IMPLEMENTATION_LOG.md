@@ -372,3 +372,65 @@ Awaiting explicit operator authorization.
 | Phase 1 Database Test | `npm run phase1:test` | ✅ PASS | 16/16 assertions passed |
 | TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
 | Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched (6 baseline tables) |
+
+---
+
+## [Entry 007] - 2026-11-17 - Phase 1 Batch 3: SMTP Reliability and Sender Identity
+
+**Scope:** Batch 3 – SMTP Reliability and Sender Identity
+**Branch:** `feat/database-foundation`
+**Starting Baseline Commit:** `8f121d2fcb0a468249dcd50d3712bbbbcb8a7301`
+**Engineer:** Senior Backend Engineer
+
+### Implementation Summary
+
+1. **Enforce SMTP Sender Identity (`src/services/emailService.ts`):**
+   - **Zero Fallback Invariant:** Completely eliminated automatic fallback to the default global Ethereal account when a campaign's explicitly configured sender credentials fail.
+   - **Sender Identity Preservation:** When `sender` is provided, `sendEmail` strictly dispatches using the sender's own credentials. If connection or authentication fails, the original error is propagated immediately with full forensic context without altering sender identity.
+   - **Permitted Default Sender:** Default SMTP credentials are utilized only when `campaign.sender_id` is null (`sender` parameter is omitted) and application policy permits it.
+   - **Cached Transporters with Session Tracking:** Implemented `createTrackedTransporter` wrapping Nodemailer transports with scoped session telemetry. Transporters are cached by cryptographic SHA-256 hash of sender credentials (`smtp_host:smtp_port:smtp_secure:smtp_user:smtp_pass`), invalidating and closing connections cleanly when credentials change.
+   - **Multi-Sender Integrity:** Tested and verified that distinct senders run concurrently with separate authenticated sessions and respective `From` headers.
+
+2. **Conservative SMTP Error Classification (`src/services/smtpClassifier.ts`):**
+   - Created dedicated `classifySmtpOutcome(error, context)` module categorizing outcomes into 5 strict categories:
+     1. `confirmed_acceptance`: Confirmed SMTP 2xx acknowledgment (terminal `sent`).
+     2. `permanent_rejection`: Definitive 5xx rejection or authentication failure (non-retryable terminal `failed`).
+     3. `transient_rejection`: Definitive 4xx temporary rejection (safe to retry, status `retry_wait`, BullMQ backoff retry scheduled).
+     4. `connection_failure`: Network or TCP socket failure confirmed before message DATA transmission (safe to retry, status `retry_wait`).
+     5. `ambiguous_outcome`: Connection drop, reset, or timeout during or after message DATA transmission (in-doubt terminal `unknown`, NEVER retried).
+   - Invariant: Only retries failures confirmed to have occurred before message acceptance. Any severed connection or timeout occurring during/after the DATA phase is treated as ambiguous (`unknown`) and never blindly retried.
+   - Extracts 3-digit SMTP status codes (e.g., `535`, `550`, `451`, `250`) and enhanced status codes (e.g., `5.7.8`, `5.1.1`, `4.3.0`, `2.0.0`).
+
+3. **Worker & Delivery Service Integration (`src/workers/emailWorker.ts`, `src/services/deliveryService.ts`):**
+   - Integrated `classifySmtpOutcome` into `emailWorker.ts`:
+     - On `confirmed_acceptance`: Extracts genuine SMTP server message ID (e.g., from `queued as <...>`) and records `sent` status in `email_deliveries` and `email_attempts` with response code `250`.
+     - On `ambiguous_outcome`: Calls `recordAttemptAmbiguousOutcome`, logs explicit warning, marks delivery and attempt as `unknown`, records in historical `email_logs`, and completes job cleanly without rethrowing (preventing BullMQ retry loops).
+     - On `permanent_rejection`: Calls `recordAttemptPermanentRejection`, marks delivery and attempt as `failed`, records in `email_logs`, and completes cleanly without rethrowing.
+     - On `transient_rejection` / `connection_failure`: Calls `recordAttemptTransientRejection` / `recordAttemptConnectionFailure`, sets delivery status to `retry_wait`, calculates exponential backoff delay, and rethrows error to allow BullMQ to handle retry scheduling.
+   - Added dedicated recording functions in `deliveryService.ts`: `recordAttemptPermanentRejection`, `recordAttemptTransientRejection`, `recordAttemptConnectionFailure`, `recordAttemptAmbiguousOutcome`.
+
+4. **Integration Test Suite (`src/scripts/testBatch3SmtpReliability.ts`):**
+   - Implemented an in-process RFC 5321 compliant SMTP server capable of deterministic fault injection across 10 acceptance scenarios:
+     1. Selected sender fails authentication: no default sender fallback (status `failed`, zero fallback).
+     2. Selected sender fails to connect: no sender switching (status `retry_wait`, zero sender switching).
+     3. No sender selected: existing permitted default-sender behaviour remains functional (status `sent`).
+     4. SMTP transient rejection before acceptance (4xx): rethrows for retry, delivery status `retry_wait`.
+     5. Permanent SMTP rejection (5xx): does not rethrow, delivery terminal `failed`.
+     6. Connection failure before DATA transmission: rethrows for retry, delivery status `retry_wait`.
+     7. Socket disconnection after DATA transmission while waiting for final acceptance: does not rethrow, delivery terminal `unknown`.
+     8. Confirmed SMTP acceptance records actual genuine message ID (not client-side UUID).
+     9. Ambiguous SMTP outcome becomes `unknown` and is NEVER automatically retried (subsequent BullMQ worker skips delivery, attempts = 1).
+     10. Multiple configured senders retain individual identities (Alpha and Beta dispatches authenticate and deliver separately).
+
+### Actual Test Results
+
+| Test Suite | Command | Result | Notes |
+|---|---|---|---|
+| Batch 3 Verification Suite | `npm run batch3:test` | ✅ PASS | 49/49 assertions passed across all 10 SMTP reliability scenarios |
+| Batch 2 Verification Suite | `npm run batch2:test` | ✅ PASS | 25/25 assertions passed across all 9 outbox/persistence scenarios |
+| Batch 1 Verification Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
+| Isolated DB Migration Suite | `npm run isolated-db:test` | ✅ PASS | 31/31 assertions passed on real ephemeral PostgreSQL |
+| Stage 1 Invariant Suite | `npm run stage1:test` | ✅ PASS | 49/49 assertions passed |
+| Phase 1 Database Test | `npm run phase1:test` | ✅ PASS | 16/16 assertions passed |
+| TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
+| Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched (6 baseline tables) |
