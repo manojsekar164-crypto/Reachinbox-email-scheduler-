@@ -214,8 +214,12 @@ async function runStage1Verification(): Promise<void> {
   const sql004Path = path.join(migrationsDir, '004_add_idempotency_and_sender_limit.sql');
   const sql004 = fs.readFileSync(sql004Path, 'utf8');
   assert(
-    sql004.includes('idx_email_logs_idempotency') && sql004.includes("WHERE status = 'sent'"),
-    'Migration 004: idx_email_logs_idempotency partial unique index defined'
+    sql004.includes('idx_email_logs_campaign_recipient'),
+    'Migration 004: idx_email_logs_campaign_recipient non-unique index defined for lookup'
+  );
+  assert(
+    !sql004.includes('CREATE UNIQUE INDEX'),
+    'Migration 004: Preserves historical duplicate safety (no unique index on historical email_logs)'
   );
   assert(
     sql004.includes('hourly_limit'),
@@ -313,11 +317,12 @@ async function runStage1Verification(): Promise<void> {
   );
   assert(
     sql007.includes("WHEN sent_log.id IS NOT NULL THEN 'sent'") &&
+    sql007.includes("WHEN ambiguous_log.id IS NOT NULL THEN 'unknown'") &&
     sql007.includes("WHEN failed_log.id IS NOT NULL THEN 'failed'") &&
-    sql007.includes("WHEN c.status = 'scheduled' THEN 'scheduled'") &&
+    sql007.includes("WHEN c.status IN ('sending', 'paused') THEN 'cancelled'") &&
     sql007.includes("WHEN c.status = 'draft' THEN 'pending'") &&
-    sql007.includes("ELSE 'pending'"),
-    'Migration 007: Accurate historical status mapping preserves existing campaign states'
+    sql007.includes("ELSE 'cancelled'"),
+    'Migration 007: Safe status mapping (ambiguous logs -> unknown, sending/paused -> cancelled, ELSE cancelled)'
   );
   assert(
     sql007.includes('INSERT INTO email_attempts') &&

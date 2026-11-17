@@ -11,6 +11,8 @@
     "db:test": "ts-node --transpile-only src/scripts/testDb.ts",
     "stage1:test": "ts-node --transpile-only src/scripts/testStage1.ts",
     "phase1:test": "ts-node --transpile-only src/scripts/testPhase1Database.ts",
+    "isolated-db:test": "ts-node --transpile-only src/scripts/testIsolatedMigration.ts",
+    "batch1:test": "ts-node --transpile-only src/scripts/testBatch1DeliveryClaiming.ts",
     "credentials:migrate": "ts-node --transpile-only src/scripts/migrateCredentials.ts",
     "worker": "ts-node-dev --respawn --transpile-only src/workers/emailWorker.ts",
     "queue:test": "ts-node --transpile-only src/scripts/testQueue.ts",

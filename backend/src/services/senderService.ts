@@ -5,11 +5,7 @@
  *
  * Key features:
  *  - Raw SQL queries via pg pool following existing database service conventions.
-<<<<<<< HEAD
- *  - Transparent AES-256-GCM authenticated credential encryption at rest.
-=======
  *  - Encrypts sensitive credentials (smtp_pass) at rest using AES-256-GCM.
->>>>>>> origin/feat/database-foundation
  *  - Restricts access strictly to the owner using `user_id = $N`.
  *  - Handles sender deletions, throwing descriptive errors if foreign key restrains deletion.
  *  - Supports shared sender-level hourly rate limits.
@@ -109,9 +105,10 @@ export async function getSenderById(
  * Gets a sender by ID without ownership checks (for internal worker use).
  */
 export async function getSenderByIdInternal(
-  id: string
+  id: string,
+  client: { query: (sql: string, params?: any[]) => Promise<any> } = db
 ): Promise<SenderRow | null> {
-  const { rows } = await db.query<SenderRow>(
+  const { rows } = await client.query(
     `SELECT * FROM senders WHERE id = $1`,
     [id]
   );

@@ -138,6 +138,13 @@ export async function runMigrations(customClient?: PoolClient): Promise<{ applie
 
       if (appliedMap.has(file)) {
         const storedChecksum = appliedMap.get(file);
+        if (!storedChecksum || storedChecksum.trim() === '') {
+          throw new Error(
+            `Security invariant violation: Migration "${file}" is recorded in schema_migrations with an empty or missing checksum! ` +
+            `Refusing to silently assign checksum without explicit verification. ` +
+            `Run controlled baseline procedure to verify migration integrity.`
+          );
+        }
         if (storedChecksum !== currentChecksum) {
           throw new Error(
             `Migration checksum mismatch for "${file}"!\n` +

@@ -66,8 +66,8 @@ async function runPhase1Tests(): Promise<void> {
   assert(files.includes('005_add_schema_migrations.sql'), 'Migration 005 exists');
 
   const m004Content = fs.readFileSync(path.join(migrationsDir, '004_add_idempotency_and_sender_limit.sql'), 'utf-8');
-  assert(m004Content.includes('idx_email_logs_idempotency'), 'Migration 004 defines idx_email_logs_idempotency');
-  assert(m004Content.includes("WHERE status = 'sent'"), 'Migration 004 creates partial unique index on status = sent');
+  assert(m004Content.includes('idx_email_logs_campaign_recipient'), 'Migration 004 defines idx_email_logs_campaign_recipient');
+  assert(!m004Content.includes('CREATE UNIQUE INDEX'), 'Migration 004 preserves historical duplicate safety (no unique index on historical email_logs)');
   assert(m004Content.includes('hourly_limit'), 'Migration 004 adds hourly_limit to senders');
 
   const m005Content = fs.readFileSync(path.join(migrationsDir, '005_add_schema_migrations.sql'), 'utf-8');

@@ -183,3 +183,134 @@
 
 ### Status
 Stage 1 implementation complete and verified on branch `feat/database-foundation`. Awaiting user review before any Stage 2 activity.
+
+---
+
+## Entry 004: Phase 1 Migration Safety Hardening & Real PostgreSQL Verification (Rounds 1–3)
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-11-17T15:35:00+05:30 |
+| **Phase / Stage** | Phase 1: Database Foundation & Delivery Reliability (Safety Reviews 1, 2, 3) |
+| **Branch** | `feat/database-foundation` |
+| **Base Commit** | `6bcdc88` |
+| **Remote URL** | `https://github.com/manojsekar164-crypto/Reachinbox-email-scheduler-.git` |
+| **Performed By** | AI Senior Backend & PostgreSQL Architect (Antigravity) |
+
+### Engineering Review Directives Implemented
+
+1. **Historical Duplicate Safety (Migration 004):**
+   - Discovered genuine historical duplicate sent logs in production backup (`campaign_id = 69d12cf2-9201-4b82-92f6-7c2ed26968ee, recipient_id = 58e14b04-cf6c-4935-8dc7-50081ba6f50c`).
+   - Removed unsafe `CREATE UNIQUE INDEX` from `004_add_idempotency_and_sender_limit.sql`.
+   - Replaced with non-unique B-tree lookup index `idx_email_logs_campaign_recipient`.
+   - Canonical idempotency enforced exclusively on `email_deliveries (campaign_id, recipient_id)` in Migration 006.
+
+2. **Relational Integrity & Historical Data Protection (Migration 006):**
+   - Replaced all `ON DELETE CASCADE` clauses on `email_deliveries` and `email_attempts` with `ON DELETE RESTRICT`.
+   - Added composite unique index `uq_recipients_id_campaign` on `recipients (id, campaign_id)`.
+   - Added composite foreign key constraint `fk_email_deliveries_recipient_campaign` on `email_deliveries (recipient_id, campaign_id) REFERENCES recipients (id, campaign_id) ON DELETE RESTRICT`.
+   - Added `deleted_at TIMESTAMPTZ` for safe soft-delete support.
+   - Added non-negative check constraints on counters (`attempt_count >= 0`).
+
+3. **Multi-Worker Outbox Leasing & Deduplication (Migration 006):**
+   - Added `claim_owner VARCHAR`, `claimed_at TIMESTAMPTZ`, and `lease_expires_at TIMESTAMPTZ` to `delivery_outbox`.
+   - Added unique constraint `uq_delivery_outbox_dedup (deduplication_key)` preventing duplicate queue publishing.
+
+4. **Fail-Closed Historical Status Mapping & Backfill (Migration 007):**
+   - Completely removed unsafe `ELSE 'pending'`.
+   - Mapped ambiguous historical logs (`status NOT IN ('sent', 'failed')`) to non-dispatchable `'unknown'`.
+   - Mapped pre-upgrade active campaigns (`sending`, `paused`) and expired scheduled campaigns to non-dispatchable `'cancelled'`.
+   - Mapped draft campaigns to `'pending'`.
+   - Deterministic tie-breaking on `ORDER BY el.created_at ASC, el.id ASC`.
+   - Cleared stale `last_error` when delivery was confirmed sent.
+   - Preserved `sender_id` and `error_message` while leaving unavailable SMTP metadata (`smtp_message_id`, `smtp_response_code`, `error_classification`) strictly as `NULL`.
+
+5. **Draft Campaign Dispatch Safety Verification:**
+   - Worker claim queries strictly enforce `JOIN campaigns c ON c.id = ed.campaign_id WHERE ed.status = 'pending' AND c.status = 'sending'`.
+   - Proved in real PostgreSQL that draft deliveries (`c.status = 'draft'`) return 0 rows to worker queries.
+   - Proved zero outbox events are created for draft campaigns during migration.
+
+6. **Migration Runner Tamper Detection (`migrate.ts`):**
+   - Rejects empty/missing checksums with explicit invariant errors.
+   - Verifies applied migration SHA-256 hashes against disk files.
+   - Serializes runner via session advisory lock `7142981`.
+
+7. **Isolated Ephemeral Integration Test Suite (`testIsolatedMigration.ts`):**
+   - Creates ephemeral database `reachinbox_migration_test`.
+   - Restores verified backup `backups/reachinbox-pre-stage1.dump`.
+   - Seeds edge cases (draft campaigns, ambiguous in-flight logs, expired scheduled, sent+failed).
+   - Executes migrations 001–007.
+   - Validates all 31 Round 3 invariants.
+   - Cleans up and verifies production database `reachinbox` remained 100% untouched.
+
+### Actual Test Results
+
+| Test Suite | Command | Result | Notes |
+|---|---|---|---|
+| Isolated PostgreSQL Live Suite | `npm run isolated-db:test` | ✅ PASS | 31/31 assertions passed on real ephemeral PostgreSQL 16.15 instance with production backup restore |
+| Stage 1 Verification Suite | `npm run stage1:test` | ✅ PASS | 49/49 assertions passed (checksums, AES-256-GCM authenticated encryption, advisory lock, check constraints, schema invariants) |
+| Phase 1 Database Test | `npm run phase1:test` | ✅ PASS | 16/16 assertions passed (migration 004 non-unique index, duplicate safety, worker concurrency) |
+| Backend TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero compilation errors; compiled cleanly to `dist/` |
+| Frontend Type Check | `npx tsc -b --noEmit` | ✅ PASS | Zero errors; frontend completely untouched |
+| Production Database Integrity | Direct SQL query | ✅ PASS | `reachinbox` database 100% untouched; exactly 6 baseline tables |
+
+### Status
+Phase 1 Migration Correction & Safety Review (Round 3) complete.
+Zero migrations executed on production database.
+Zero git commits or pushes made.
+Awaiting explicit operator authorization.
+
+---
+
+## Entry 005: Batch 1 – Atomic Delivery Claiming and Worker Idempotency
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-11-17T16:15:00+05:30 |
+| **Batch** | Batch 1: Atomic Delivery Claiming & Worker Idempotency |
+| **Branch** | `feat/database-foundation` |
+| **Base Commit** | `6bcdc88` |
+| **Remote URL** | `https://github.com/manojsekar164-crypto/Reachinbox-email-scheduler-.git` |
+| **Performed By** | AI Senior Backend & PostgreSQL Architect (Antigravity) |
+
+### Engineering Fixes Implemented
+
+1. **Atomic Delivery Claiming (`src/services/deliveryService.ts`):**
+   - Implemented `claimDelivery()` using PostgreSQL `FOR UPDATE OF ed SKIP LOCKED` with atomic `UPDATE email_deliveries ... RETURNING ed.*`.
+   - Transitions delivery status atomically to `'sending'`.
+   - Records `claim_owner`, `claimed_at`, and `lease_expires_at` (default 60 seconds lease).
+   - Verifies campaign eligibility: requires `campaigns.status = 'sending'`.
+   - Strictly excludes soft-deleted deliveries (`deleted_at IS NULL`).
+   - Ensures concurrent workers racing for the exact same delivery never double-claim: exactly one worker acquires the row, the concurrent worker receives `NULL` and skips without blocking.
+
+2. **Worker Idempotency & Attempt Tracking (`src/workers/emailWorker.ts`):**
+   - Uses `email_deliveries` as the canonical delivery state machine.
+   - Pre-flight check: if delivery `status = 'sent'`, skips immediately without sending.
+   - Audit trail: records each dispatch attempt in `email_attempts` (`attempt_number`, `status`, `sender_id`, `attempted_at`, `completed_at`, `smtp_message_id`).
+   - Duplicate BullMQ job safety: subsequent duplicate jobs detect `delivery.status === 'sent'` and complete idempotently without duplicate sends or additional attempts.
+   - Backward compatibility: preserves historical `email_logs` recording on delivery success and failure.
+
+3. **Uncertain Delivery Outcome Safety:**
+   - Detects in-doubt SMTP errors (`isUncertainSmtpError()`: socket resets, timeouts during DATA transmission, explicit uncertain flags).
+   - Marks delivery and attempt as `'unknown'`.
+   - Does NOT rethrow to BullMQ, preventing automated duplicate retry loops.
+   - Subsequent retry attempts explicitly refuse to blindly send deliveries in `'unknown'` status.
+
+4. **Integration Test Suite (`src/scripts/testBatch1DeliveryClaiming.ts`):**
+   - Tests all 5 verification scenarios against ephemeral database `reachinbox_migration_test`:
+     1. Two workers claiming the same delivery concurrently (`FOR UPDATE SKIP LOCKED`).
+     2. Processing an already-sent delivery (idempotency, zero sends).
+     3. Reprocessing a duplicate BullMQ job (zero duplicate attempts).
+     4. An uncertain delivery outcome (mapped to `'unknown'`, never automatically retried).
+     5. Soft-delete and draft campaign eligibility safety.
+
+### Actual Test Results
+
+| Test Suite | Command | Result | Notes |
+|---|---|---|---|
+| Batch 1 Verification Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
+| Isolated DB Migration Suite | `npm run isolated-db:test` | ✅ PASS | 31/31 assertions passed on real ephemeral PostgreSQL |
+| Stage 1 Invariant Suite | `npm run stage1:test` | ✅ PASS | 49/49 assertions passed |
+| Phase 1 Database Test | `npm run phase1:test` | ✅ PASS | 16/16 assertions passed |
+| TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
+| Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched (6 baseline tables) |

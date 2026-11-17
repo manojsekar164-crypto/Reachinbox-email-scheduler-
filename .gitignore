@@ -43,3 +43,7 @@ Thumbs.db
 coverage/
 */coverage/
 .nyc_output/
+
+# Backups and database dumps
+backups/
+*.dump

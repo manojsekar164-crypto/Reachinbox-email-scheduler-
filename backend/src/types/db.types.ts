@@ -91,3 +91,77 @@ export interface SchemaMigrationRow {
   checksum: string;
   applied_at: Date;
 }
+
+// ─── email_deliveries ─────────────────────────────────────────────────────────
+export type DeliveryStatus =
+  | 'pending'
+  | 'scheduled'
+  | 'sending'
+  | 'retry_wait'
+  | 'sent'
+  | 'failed'
+  | 'unknown'
+  | 'cancelled';
+
+export interface EmailDeliveryRow {
+  id: string;
+  campaign_id: string;
+  recipient_id: string;
+  sender_id: string | null;
+  idempotency_key: string;
+  status: DeliveryStatus;
+  scheduled_at: Date | null;
+  sent_at: Date | null;
+  smtp_message_id: string | null;
+  attempt_count: number;
+  last_error: string | null;
+  next_attempt_at: Date | null;
+  claim_owner: string | null;
+  claimed_at: Date | null;
+  lease_expires_at: Date | null;
+  deleted_at: Date | null;
+  created_at: Date;
+  updated_at: Date;
+}
+
+// ─── email_attempts ───────────────────────────────────────────────────────────
+export type EmailAttemptStatus =
+  | 'attempting'
+  | 'sent'
+  | 'failed'
+  | 'unknown'
+  | 'rate_limited';
+
+export interface EmailAttemptRow {
+  id: string;
+  delivery_id: string;
+  attempt_number: number;
+  status: EmailAttemptStatus;
+  sender_id: string | null;
+  smtp_response_code: string | null;
+  smtp_message_id: string | null;
+  error_classification: string | null;
+  error_message: string | null;
+  attempted_at: Date;
+  completed_at: Date | null;
+}
+
+// ─── delivery_outbox ──────────────────────────────────────────────────────────
+export type OutboxStatus = 'pending' | 'processing' | 'dispatched' | 'failed';
+
+export interface DeliveryOutboxRow {
+  id: string;
+  event_type: string;
+  aggregate_id: string;
+  deduplication_key: string;
+  payload: Record<string, any>;
+  status: OutboxStatus;
+  attempt_count: number;
+  claim_owner: string | null;
+  claimed_at: Date | null;
+  lease_expires_at: Date | null;
+  available_at: Date;
+  created_at: Date;
+  dispatched_at: Date | null;
+  last_error: string | null;
+}
