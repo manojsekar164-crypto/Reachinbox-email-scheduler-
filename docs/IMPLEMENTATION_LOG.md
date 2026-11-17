@@ -920,3 +920,59 @@ Fix two campaign-control defects in campaign lifecycle management:
 | Batch 1 Regression Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
 | TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
 | Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched |
+
+---
+
+## 2026-11-17 – Entry 017: Batch 7A – Operations Intelligence Data Service
+
+### Scope & Objective
+Implement a dedicated Operations Intelligence Data Service (`operationsIntelligenceService.ts`) providing authoritative, aggregated operational telemetry across campaigns, deliveries, attempts, senders, queues, and rate limiters. This service establishes the trusted data layer for operational monitoring and the upcoming AI Delivery Operations Copilot.
+
+### Architectural Invariants & Key Implementations
+1. **Multi-Tenant Security & Parameterized SQL**:
+   - Every function strictly requires and enforces authenticated `userId`.
+   - All queries join on `campaigns.user_id = $1` or `senders.user_id = $1`.
+   - Never exposes SMTP passwords, OAuth tokens, or secrets (`s.smtp_pass` is excluded).
+   - Minimizes PII: no recipient names or email addresses in operational context documents.
+2. **Campaign Intelligence (`getCampaignIntelligence`)**:
+   - Computes total campaigns and status distribution (`draft`, `scheduled`, `sending`, `paused`, `completed`, `cancelled`).
+   - Maps aggregate deliveries across all statuses (`sent`, `failed`, `pending`, `retry_wait`, `unknown`, `scheduled`, `cancelled`).
+   - Calculates confirmed `success_rate` and `failure_rate` using terminal deliveries (`sent / (sent + failed)`).
+   - Identifies high failure campaigns ($\ge 20\%$ failure rate or $\ge 5$ failures).
+3. **Delivery Failure Intelligence (`getDeliveryFailureIntelligence`)**:
+   - Reports failed and unknown deliveries separately.
+   - Categorizes error classifications (`permanent_rejection`, `transient_rejection`, `connection_failure`, `ambiguous_outcome`, etc.).
+   - Distinguishes transient vs. permanent vs. uncertain failure distributions.
+   - Summarizes top failure reasons with bounded sample delivery IDs for citation.
+   - Tracks attempt distributions and identifies deliveries approaching retry limits ($\text{attempt\_count} \ge 2$).
+4. **Sender Performance Intelligence (`getSenderPerformanceIntelligence`)**:
+   - Evaluates performance sender-by-sender using isolated CTEs to prevent Cartesian products.
+   - Distinguishes total dispatch attempts from unique recipient deliveries.
+   - Distinguishes confirmed SMTP acceptance (`RFC 5321 250 OK`) from recipient inbox delivery.
+   - Assigns objective, data-driven health states (`healthy`, `degraded`, `critical`, `idle`).
+5. **Queue Intelligence (`getQueueIntelligence`)**:
+   - Inspects BullMQ/Redis queue backlog (`waiting`, `active`, `delayed`, `failed`).
+   - Enforces campaign-level queue isolation: user-scoped counts reflect only jobs matching the user's campaign IDs.
+   - Gracefully handles Redis disconnection/outage with `is_available: false` and explicit diagnosis without throwing.
+6. **Operational Bottleneck Analysis (`analyzeOperationalBottlenecks`)**:
+   - Evaluates campaign hourly limits, global rate limits, sender rate limits, minimum send spacing, excessive retries, queue backlogs, and unresolved unknown outcomes.
+   - Reports observed facts, calculated indicators, actionable recommendations, and underlying source IDs.
+7. **Structured Operations Context (`getOperationsContext`)**:
+   - Produces a sanitized, compact, citation-friendly operations document for future LLM consumption.
+   - Includes data freshness timestamp, investigation recommendations, and documented metric definitions.
+8. **Strict Read-Only Guarantee**:
+   - Performs zero database or queue mutations during intelligence queries.
+
+### Actual Test Results
+
+| Test Suite | Command | Result | Notes |
+|---|---|---|---|
+| Batch 7A Verification Suite | `npm run batch7a:test` | ✅ PASS | 92/92 assertions passed across all 13 test scenarios |
+| Batch 6 & 6.1 Verification Suite | `npm run batch6:test` | ✅ PASS | 108/108 assertions passed across all 19 test scenarios |
+| Batch 5 Verification Suite | `npm run batch5:test` | ✅ PASS | 142/142 assertions passed across all 21 test sections |
+| Batch 4 Regression Suite | `npm run batch4:test` | ✅ PASS | 51/51 assertions passed across all 10 scenarios |
+| Batch 3 Regression Suite | `npm run batch3:test` | ✅ PASS | 96/96 assertions passed across all 14 scenarios |
+| Batch 2 Regression Suite | `npm run batch2:test` | ✅ PASS | 25/25 assertions passed across all 9 outbox/persistence scenarios |
+| Batch 1 Regression Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
+| TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
+| Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched |

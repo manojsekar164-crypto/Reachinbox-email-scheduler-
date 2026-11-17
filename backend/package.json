@@ -18,6 +18,7 @@
     "batch4:test": "ts-node --transpile-only src/scripts/testBatch4RateLimitingAndSpacing.ts",
     "batch5:test": "ts-node --transpile-only src/scripts/testBatch5Preflight.ts",
     "batch6:test": "ts-node --transpile-only src/scripts/testBatch6Recovery.ts",
+    "batch7a:test": "ts-node --transpile-only src/scripts/testBatch7AOperationsIntelligence.ts",
     "credentials:migrate": "ts-node --transpile-only src/scripts/migrateCredentials.ts",
     "worker": "ts-node-dev --respawn --transpile-only src/workers/emailWorker.ts",
     "queue:test": "ts-node --transpile-only src/scripts/testQueue.ts",

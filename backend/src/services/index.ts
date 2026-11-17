@@ -10,3 +10,4 @@ export * from './campaignService';
 export * from './slackService';
 export * from './sendSpacing';
 export * from './recoveryService';
+export * from './operationsIntelligenceService';
