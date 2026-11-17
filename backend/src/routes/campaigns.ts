@@ -16,11 +16,16 @@ import {
   removeCampaign,
   listRecipients,
 } from '../controllers/campaignController';
+import { preflightCampaignHandler } from '../controllers/preflightController';
 
 const router = Router();
 
 // All campaign routes require a valid session.
 router.use(requireAuth);
+
+// ─── Smart Campaign Preflight ────────────────────────────────────────────────
+router.post('/preflight', preflightCampaignHandler);
+router.post('/:id/preflight', preflightCampaignHandler);
 
 // ─── Campaign CRUD ────────────────────────────────────────────────────────────
 router.post('/', createCampaign);

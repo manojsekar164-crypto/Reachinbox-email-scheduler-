@@ -16,6 +16,7 @@
     "batch2:test": "ts-node --transpile-only src/scripts/testBatch2OutboxAndQueuePersistence.ts",
     "batch3:test": "ts-node --transpile-only src/scripts/testBatch3SmtpReliability.ts",
     "batch4:test": "ts-node --transpile-only src/scripts/testBatch4RateLimitingAndSpacing.ts",
+    "batch5:test": "ts-node --transpile-only src/scripts/testBatch5Preflight.ts",
     "credentials:migrate": "ts-node --transpile-only src/scripts/migrateCredentials.ts",
     "worker": "ts-node-dev --respawn --transpile-only src/workers/emailWorker.ts",
     "queue:test": "ts-node --transpile-only src/scripts/testQueue.ts",

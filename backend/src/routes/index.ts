@@ -4,6 +4,7 @@ import authRouter from './auth';
 import campaignRouter from './campaigns';
 import emailRouter from './emails';
 import senderRouter from './senders';
+import preflightRouter from './preflight';
 import { queuesDashboardRouter } from './queues';
 
 const router = Router();
@@ -14,6 +15,7 @@ router.use('/auth', authRouter);
 router.use('/campaigns', campaignRouter);
 router.use('/emails', emailRouter);
 router.use('/senders', senderRouter);
+router.use('/preflight', preflightRouter);
 
 // Expose Bull Board dashboard at /admin/queues (development only)
 router.use('/admin/queues', queuesDashboardRouter);

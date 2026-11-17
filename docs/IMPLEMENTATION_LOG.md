@@ -1,4 +1,4 @@
-# IMPLEMENTATION LOG — ReachInbox Email Delivery Platform
+﻿# IMPLEMENTATION LOG — ReachInbox Email Delivery Platform
 
 ---
 
@@ -636,3 +636,58 @@ Awaiting explicit operator authorization.
 | TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
 | Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched |
 
+
+---
+
+## [Entry 012] - 2026-11-17 - Phase 1 Batch 5: Smart Campaign Preflight (Backend Only)
+
+**Scope:** Batch 5 – Smart Campaign Preflight & Delivery Forecast
+**Branch:** `feat/database-foundation`
+**Starting Baseline Commit:** `5ede7a8`
+**Engineer:** Senior Backend Engineer
+
+### Implementation Summary
+
+1. **Recipient Validation Engine (`src/services/preflightService.ts`):**
+   - **Delimited & Plain Text Parsing:** Implemented `parseRawContent()` with automatic delimiter detection (`,`, `;`, `\t`), UTF-8 BOM stripping, escaped quote handling (`""`), and newline normalization. Handles headered and headerless CSVs, line-delimited plain text, and direct JSON recipient arrays.
+   - **Malformed & Edge Case Safety:** Safe rejection for binary content (`\0`), missing email header columns, empty files, and oversized uploads (>5MB) without unhandled exceptions.
+   - **Multi-Level Deduplication & Integrity:**
+     - Validates format compliance using standard RFC 5322 regex.
+     - Detects in-batch duplicates with case-insensitive normalization, placing duplicates into `duplicates` list with row numbers and descriptive reasons.
+     - Performs PostgreSQL lookup to identify recipients that already exist within the targeted campaign (`existing` list).
+   - **Summary Counts:** Generates exact counts (`total_rows`, `valid_count`, `invalid_count`, `duplicate_count`, `existing_count`).
+
+2. **Sender Capacity & Delivery Forecast Engine (`src/services/preflightService.ts`):**
+   - **Read-Only Capacity Inspection:**
+     - Evaluates sender hourly capacity, remaining quota, and rolling window TTL from Redis.
+     - Evaluates campaign hourly capacity and remaining quota.
+     - Evaluates global hourly capacity via `getGlobalHourlyLimit()`, cleanly reflecting disabled state when set to 0.
+     - Evaluates minimum spacing constraints (`sendDelayMs`) and derives theoretical maximum hourly rate.
+     - Queries BullMQ queue job counts (`waiting` + `active`) to factor in existing backlog.
+   - **Bottleneck Detection:** Identifies the primary bottleneck (`campaign_hourly_limit`, `sender_hourly_limit`, `global_hourly_limit`, or `minimum_spacing`).
+   - **Delivery Forecasting:** Computes realistic multi-hour delivery start time, completion time, and duration in seconds. Accurately predicts multi-hour roll-over when recipient count exceeds current-hour capacity.
+   - **Disclaimers & Disclosures:** Marks forecast as approximate (`is_approximate: true`), provides explicit operating assumptions, and produces actionable warnings for queue backlog, multi-hour delays, or exhausted quotas.
+
+3. **HTTP API Integration (`src/controllers/preflightController.ts`, `src/routes/`):**
+   - Exposes authenticated endpoints:
+     - `POST /campaigns/preflight`
+     - `POST /campaigns/:id/preflight`
+     - `POST /preflight`
+   - Scopes all queries strictly to the authenticated user (`req.user.id`).
+   - Validates input sizes (rejects uploads >5MB with 413 Payload Too Large) and payload structure (UUIDs, limits, timestamps).
+   - Guarantees 100% read-only operation: zero database inserts, zero BullMQ jobs, and zero rate-limit reservations.
+
+4. **Batch 5 Acceptance Test Suite (`src/scripts/testBatch5Preflight.ts`):**
+   - 90 rigorous test assertions covering valid CSV parsing, invalid format detection, in-upload duplicate detection, campaign pre-existence detection, malformed/oversized file safety, exact validation counts, global/sender/campaign/spacing capacity calculations, forecast duration accuracy, absolute zero-side-effect verification, user isolation, and controller HTTP status codes (200, 400, 401, 413).
+
+### Actual Test Results
+
+| Test Suite | Command | Result | Notes |
+|---|---|---|---|
+| Batch 5 Verification Suite | `npm run batch5:test` | ✅ PASS | 90/90 assertions passed across all 12 scenarios + controller unit tests |
+| Batch 4 Regression Suite | `npm run batch4:test` | ✅ PASS | 51/51 assertions passed across all 10 scenarios |
+| Batch 3 Regression Suite | `npm run batch3:test` | ✅ PASS | 96/96 assertions passed across all 14 scenarios |
+| Batch 2 Regression Suite | `npm run batch2:test` | ✅ PASS | 25/25 assertions passed across all 9 outbox/persistence scenarios |
+| Batch 1 Regression Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
+| TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
+| Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched |
