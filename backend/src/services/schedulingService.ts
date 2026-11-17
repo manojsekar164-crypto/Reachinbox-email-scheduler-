@@ -63,6 +63,7 @@ export async function scheduleEmailJobs(
     };
 
     const job = await emailQueue.add('send-email', payload, {
+      jobId: `campaign_${campaign.id}_${recipient.id}`,
       delay: delayMs,
       // Job-level options inherit queue defaults (attempts=3, backoff=exponential).
     });

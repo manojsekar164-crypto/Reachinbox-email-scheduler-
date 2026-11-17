@@ -33,7 +33,10 @@ const defaultJobOptions: DefaultJobOptions = {
     type: 'exponential',
     delay: 5000,               // 5 seconds base delay
   },
-  removeOnComplete: true,      // Automatically remove successful jobs to save memory
+  removeOnComplete: {
+    count: 1000,               // Retain last 1000 completed jobs for audit & Bull Board
+    age: 86400,                // Auto-expire after 24 hours
+  },
   removeOnFail: false,         // Keep failed jobs for inspection
 };
 

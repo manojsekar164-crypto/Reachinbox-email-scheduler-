@@ -236,7 +236,7 @@ export async function getCampaign(
 // ---------------------------------------------------------------------------
 
 const ALLOWED_STATUSES: CampaignStatus[] = [
-  'draft', 'scheduled', 'sending', 'sent', 'failed',
+  'draft', 'scheduled', 'sending', 'completed', 'sent', 'failed',
 ];
 
 export async function patchCampaign(

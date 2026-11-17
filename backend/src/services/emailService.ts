@@ -145,38 +145,39 @@ export async function sendEmail({ sender, to, subject, text, html }: SendEmailOp
       previewUrl,
     };
   } catch (primaryErr: any) {
-    console.warn(`⚠️ [Nodemailer] Primary sender dispatch failed (${primaryErr.message}). Retrying with verified system SMTP...`);
-    
-    try {
-      // 2. Resilient fallback to default system transporter
-      const fallbackInfo = await defaultTransporter.sendMail({
-        from: config.smtp.from,
-        to,
-        subject,
-        text,
-        html,
-      });
+    if (sender) {
+      console.warn(
+        `⚠️ [Nodemailer] Primary sender dispatch failed (${primaryErr.message}). Retrying with verified system SMTP...`
+      );
 
-      const fallbackPreview = nodemailer.getTestMessageUrl(fallbackInfo);
+      try {
+        // Fallback to verified default system transporter
+        const fallbackInfo = await defaultTransporter.sendMail({
+          from: config.smtp.from,
+          to,
+          subject,
+          text,
+          html,
+        });
 
-      return {
-        messageId: fallbackInfo.messageId,
-        previewUrl: fallbackPreview,
-      };
-    } catch (fallbackErr: any) {
-      console.warn(`⚠️ [Nodemailer] Cloud outbound SMTP socket blocked by hosting provider (${fallbackErr.message}). Generating resilient cloud delivery record...`);
-      
-      // 3. Cloud sandbox resilience: When hosting providers block outbound SMTP TCP connections,
-      // generate a validated message ID and Ethereal preview link so the delivery succeeds with 100% reliability.
-      const uniqueId = crypto.randomBytes(12).toString('hex');
-      const generatedMessageId = `<${uniqueId}@reachinbox.email>`;
-      const simulatedPreviewUrl = `https://ethereal.email/message/apG0OEebeQl00oL2ap${uniqueId}AAAAuy5yjREp`;
+        const fallbackPreview = nodemailer.getTestMessageUrl(fallbackInfo);
 
-      return {
-        messageId: generatedMessageId,
-        previewUrl: simulatedPreviewUrl,
-      };
+        return {
+          messageId: fallbackInfo.messageId,
+          previewUrl: fallbackPreview,
+        };
+      } catch (fallbackErr: any) {
+        console.error(
+          `❌ [Nodemailer] System SMTP fallback also failed (${fallbackErr.message}). Propagating real delivery error.`
+        );
+        throw new Error(
+          `Primary sender failed: ${primaryErr.message}; System fallback failed: ${fallbackErr.message}`
+        );
+      }
     }
+
+    console.error(`❌ [Nodemailer] SMTP dispatch failed (${primaryErr.message}). Propagating real delivery error.`);
+    throw primaryErr;
   }
 }
 

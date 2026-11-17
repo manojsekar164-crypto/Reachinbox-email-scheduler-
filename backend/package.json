@@ -23,6 +23,7 @@
     "slack-oauth:test": "ts-node --transpile-only src/scripts/testSlackOAuth.ts",
     "scheduled-email:test": "ts-node --transpile-only src/scripts/testScheduledEmail.ts",
     "scheduled-recovery:test": "ts-node --transpile-only src/scripts/testScheduledRecovery.ts",
+    "phase1:test": "ts-node --transpile-only src/scripts/testPhase1Database.ts",
     "load:test": "ts-node --transpile-only src/scripts/loadTest.ts"
   },
   "keywords": [

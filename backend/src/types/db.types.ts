@@ -1,7 +1,7 @@
 /**
  * Database row types – one interface per table.
  * These match the column names returned by `pg` (snake_case).
- * Keep in sync with 001_initial_schema.sql.
+ * Keep in sync with migration SQL files.
  */
 
 // ─── users ────────────────────────────────────────────────────────────────────
@@ -15,7 +15,7 @@ export interface UserRow {
 }
 
 // ─── campaigns ────────────────────────────────────────────────────────────────
-export type CampaignStatus = 'draft' | 'scheduled' | 'sending' | 'sent' | 'failed';
+export type CampaignStatus = 'draft' | 'scheduled' | 'sending' | 'completed' | 'sent' | 'failed';
 
 export interface CampaignRow {
   id: string;
@@ -67,6 +67,7 @@ export interface SenderRow {
   smtp_secure: boolean;
   smtp_user: string;
   smtp_pass: string;
+  hourly_limit: number;
   created_at: Date;
   updated_at: Date;
 }
@@ -85,4 +86,3 @@ export interface SlackIntegrationRow {
   created_at: Date;
   updated_at: Date;
 }
-
