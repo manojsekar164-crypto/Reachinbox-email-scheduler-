@@ -398,7 +398,7 @@ export async function reconcileStaleDeliveries(
        FROM email_deliveries ed
        WHERE ed.status = 'sending'
          AND ed.lease_expires_at IS NOT NULL
-         AND ed.lease_expires_at < NOW()
+         AND ed.lease_expires_at <= NOW()
          AND ed.deleted_at IS NULL
        FOR UPDATE OF ed SKIP LOCKED
      )
@@ -417,16 +417,16 @@ export async function reconcileStaleDeliveries(
   const reconciledIds = staleResult.rows.map((r) => r.id);
 
   // Step 2: Update any unresolved 'attempting' records to 'unknown'
-  for (const deliveryId of reconciledIds) {
+  if (reconciledIds.length > 0) {
     await client.query(
       `UPDATE email_attempts
        SET status = 'unknown',
            error_classification = 'stale_claim_reconciliation',
            error_message = 'Worker claim expired before SMTP outcome could be recorded. Delivery outcome is uncertain.',
            completed_at = NOW()
-       WHERE delivery_id = $1
+       WHERE delivery_id = ANY($1::uuid[])
          AND status = 'attempting';`,
-      [deliveryId]
+      [reconciledIds]
     );
   }
 

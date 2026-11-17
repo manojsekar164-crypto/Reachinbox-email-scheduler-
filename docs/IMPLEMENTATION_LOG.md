@@ -535,3 +535,43 @@ Awaiting explicit operator authorization.
 | Batch 1 Verification Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
 | TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
 | Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched (6 baseline tables) |
+
+
+---
+
+## [Entry 010] - 2026-11-17 - Phase 1 Batch 3.3: Runtime Stale Delivery Reconciliation
+
+**Scope:** Batch 3.3 – Runtime Stale Delivery Reconciliation
+**Branch:** `feat/database-foundation`
+**Starting Baseline Commit:** `10763ae245df6f7e443833d7b4cb68010cf354aa`
+**Engineer:** Senior Backend Engineer
+
+### Implementation Summary
+
+1. **Worker Runtime Stale Reconciliation Integration (`src/workers/emailWorker.ts`):**
+   - **Startup Recovery Invariant:** Implemented `initializeWorker(dbClient)` ensuring `reconcileStaleDeliveries()` strictly executes during worker startup before normal job processing begins. Instantiates BullMQ worker with `autorun: false`, awaits startup reconciliation, and then calls `worker.run()`.
+   - **Event-Driven Runtime In-Flight Check:** In `processEmailJob`, added Invariant 3.5: if a delivery is found in `sending` status with an expired lease (`lease_expires_at <= NOW()`), it prioritizes reconciling it to `unknown` immediately, refreshing the delivery state, and skipping execution without resending. Active in-flight deliveries with live leases are skipped cleanly.
+   - **Bounded Event-Driven Sweeps (`maybeReconcileStaleDeliveries`):** Wired bounded event-driven reconciliation (at most once every 10 seconds) into `processEmailJob` and BullMQ's `drained` event listener, ensuring stale deliveries from crashes during process lifetime are also eventually reconciled without introducing any cron, fixed polling, or `setInterval` schedulers.
+   - **Atomic In-Memory Batch Attempt History Update:** Refactored `reconcileStaleDeliveries` in `deliveryService.ts` to update all corresponding `attempting` records in a single query (`WHERE delivery_id = ANY($1::uuid[]) AND status = 'attempting'`).
+
+2. **Real Database Outage Test (`src/scripts/testBatch3SmtpReliability.ts`):**
+   - **Zero Manual SQL Editing:** Completely eliminated simulated manual `UPDATE` queries. The test creates a dedicated client, claims the delivery, records the attempt in `attempting`, and upon confirmed SMTP acceptance, fires `onSmtpAccepted` which terminates the backend PID via `SELECT pg_terminate_backend(pid)` on `adminClient`.
+   - **Actual Connection Loss Verification:** Verified worker catches the terminated connection without crashing or rethrowing.
+   - **Post-Outage Authoritative State:** Verified that before reconciliation, PostgreSQL naturally held delivery in `sending` and attempt in `attempting` solely due to the terminated connection.
+   - **Restored Connectivity & Reconciliation:** Restored database connectivity via a fresh client, waited for the 1.2s lease to expire, and ran `reconcileStaleDeliveries()`.
+   - **Verified Reconciliation Outcomes:**
+     - Delivery transitioned to `unknown` with claim owner and lease expiry cleared.
+     - Attempt history transitioned to `unknown` with classification `stale_claim_reconciliation`.
+     - Subsequent BullMQ worker execution skipped without resending.
+     - Second worker could not claim the delivery (`claimDelivery` returned `null`).
+     - SMTP test server received strictly one submission in total (zero duplicate dispatches).
+
+### Actual Test Results
+
+| Test Suite | Command | Result | Notes |
+|---|---|---|---|
+| Batch 3 Verification Suite | `npm run batch3:test` | ✅ PASS | 96/96 assertions passed across all 14 scenarios (including enhanced real-outage Scenario 13) |
+| Batch 2 Verification Suite | `npm run batch2:test` | ✅ PASS | 25/25 assertions passed across all 9 outbox/persistence scenarios |
+| Batch 1 Verification Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
+| TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
+| Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched (6 baseline tables) |

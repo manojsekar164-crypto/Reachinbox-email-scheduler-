@@ -57,6 +57,8 @@ export async function processEmailJob(
       simulateUncertain?: boolean;
       simulateDbFailureAfterSend?: boolean;
       simulateNoResponseCode?: boolean;
+      leaseDurationMs?: number;
+      onSmtpAccepted?: () => Promise<void>;
       testWindowSeconds?: number;
     };
     attemptsMade: number;
@@ -73,6 +75,8 @@ export async function processEmailJob(
     simulateUncertain,
     simulateDbFailureAfterSend,
     simulateNoResponseCode,
+    leaseDurationMs,
+    onSmtpAccepted,
     testWindowSeconds,
   } = job.data;
   const attempt = job.attemptsMade + 1;
@@ -81,6 +85,9 @@ export async function processEmailJob(
   console.log(`\n⏳ [Job ${jobId}] Attempt ${attempt}`);
   console.log(`   campaign=${campaignId}`);
   console.log(`   recipient=${recipientId}`);
+
+  // --- 0. Event-Driven Stale Delivery Reconciliation (Bounded) ---
+  await maybeReconcileStaleDeliveries(dbClient);
 
   // --- 1. Load Campaign and Recipient ---
   const campaignResult = await dbClient.query<CampaignRow>(
@@ -133,6 +140,32 @@ export async function processEmailJob(
     return;
   }
 
+  // Invariant 3.5: Stale in-flight delivery safety
+  // Never automatically resend a delivery that is currently in 'sending' status.
+  // If its lease has expired, prioritize reconciling it to 'unknown' immediately.
+  if (delivery.status === 'sending') {
+    const isLeaseExpired =
+      delivery.lease_expires_at && new Date(delivery.lease_expires_at).getTime() <= Date.now();
+    if (isLeaseExpired) {
+      console.log(
+        `   ⚠️ [Job ${jobId}] Stale in-flight delivery detected (status: 'sending' with expired lease). Reconciling to 'unknown'.`
+      );
+      await reconcileStaleDeliveries(dbClient);
+      const refreshed = await getDelivery(campaignId, recipientId, dbClient);
+      if (refreshed && refreshed.status === 'unknown') {
+        console.log(
+          `   ⚠️ [Job ${jobId}] Delivery outcome is uncertain (status: 'unknown'). Never automatically retrying. Skipping.`
+        );
+        return;
+      }
+    } else {
+      console.log(
+        `   ⏸️ [Job ${jobId}] Delivery is actively in-flight (status: 'sending' with active lease). Skipping.`
+      );
+      return;
+    }
+  }
+
   // --- Scheduled Campaign Check & Due Activation ---
   if (campaign.status === 'scheduled') {
     if (campaign.scheduled_at && new Date(campaign.scheduled_at).getTime() > Date.now()) {
@@ -173,7 +206,7 @@ export async function processEmailJob(
     campaignId,
     recipientId,
     claimOwner: workerClaimOwner,
-    leaseDurationMs: 60000,
+    leaseDurationMs: leaseDurationMs || 60000,
     dbClient,
   });
 
@@ -306,6 +339,10 @@ export async function processEmailJob(
       html: bodyHtml,
     });
     smtpConfirmed = true;
+
+    if (onSmtpAccepted && config.app.nodeEnv !== 'production') {
+      await onSmtpAccepted();
+    }
   } catch (smtpError: any) {
     // STRICT ISOLATED SMTP ERROR BOUNDARY:
     // Only actual SMTP or network transport errors are classified and handled here.
@@ -499,8 +536,32 @@ export async function processEmailJob(
 
 export let worker: Worker<EmailJobPayload, void, string> | null = null;
 
-if (process.env.START_WORKER !== 'false') {
-  worker = new Worker<EmailJobPayload, void, string>(
+// ---------------------------------------------------------------------------
+// Event-Driven & Bounded Stale Delivery Reconciliation
+// ---------------------------------------------------------------------------
+let lastEventReconciliationMs = 0;
+const MIN_RECONCILIATION_INTERVAL_MS = 10_000;
+
+export async function maybeReconcileStaleDeliveries(dbClient = pool): Promise<void> {
+  const now = Date.now();
+  if (now - lastEventReconciliationMs < MIN_RECONCILIATION_INTERVAL_MS) {
+    return;
+  }
+  lastEventReconciliationMs = now;
+  try {
+    const result = await reconcileStaleDeliveries(dbClient);
+    if (result.reconciledCount > 0) {
+      console.log(
+        `⚠️  [EventReconciliation] Reconciled ${result.reconciledCount} stale in-flight delivery(ies) to 'unknown'`
+      );
+    }
+  } catch (err: any) {
+    console.warn(`⚠️ [EventReconciliation] Notice: ${err.message}`);
+  }
+}
+
+export function createWorkerInstance(): Worker<EmailJobPayload, void, string> {
+  const w = new Worker<EmailJobPayload, void, string>(
     emailQueueName,
     async (job: Job<EmailJobPayload>) => {
       await processEmailJob(job);
@@ -508,19 +569,63 @@ if (process.env.START_WORKER !== 'false') {
     {
       connection: redisConnectionOptions,
       concurrency: workerConcurrency,
+      autorun: false,
     }
   );
 
-  worker.on('completed', (job) => {
+  w.on('completed', (job) => {
     console.log(`🟢 [Job ${job.id}] Successfully completed.`);
   });
 
-  worker.on('failed', (job, err) => {
+  w.on('failed', (job, err) => {
     console.error(`🔴 [Job ${job?.id}] Failed with error: ${err.message}`);
   });
 
-  worker.on('error', (err) => {
+  w.on('error', (err) => {
     console.error(`❌ Worker error: ${err.message}`);
+  });
+
+  w.on('drained', async () => {
+    await maybeReconcileStaleDeliveries(pool);
+  });
+
+  return w;
+}
+
+/**
+ * Initializes and starts the worker with startup stale delivery reconciliation.
+ * Executes reconcileStaleDeliveries() BEFORE normal job processing begins.
+ */
+export async function initializeWorker(dbClient = pool): Promise<Worker<EmailJobPayload, void, string> | null> {
+  try {
+    console.log('🔄 [Worker Startup] Running startup stale delivery reconciliation...');
+    const result = await reconcileStaleDeliveries(dbClient);
+    if (result.reconciledCount > 0) {
+      console.log(
+        `⚠️  [Worker Startup] Reconciled ${result.reconciledCount} stale in-flight delivery(ies) to 'unknown'`
+      );
+    } else {
+      console.log('✅ [Worker Startup] Startup stale delivery check complete (0 stale deliveries).');
+    }
+  } catch (err: any) {
+    console.error('❌ [Worker Startup] Stale delivery reconciliation error during startup:', err.message);
+  }
+
+  if (process.env.START_WORKER !== 'false') {
+    if (!worker) {
+      worker = createWorkerInstance();
+    }
+    worker.run();
+    console.log('👷 BullMQ worker active and processing jobs.');
+    return worker;
+  }
+
+  return null;
+}
+
+if (process.env.START_WORKER !== 'false') {
+  initializeWorker().catch((err) => {
+    console.error('❌ [Worker Startup] Failed to initialize worker:', err);
   });
 }
 

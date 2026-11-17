@@ -38,7 +38,7 @@ import { execSync } from 'child_process';
 import path from 'path';
 import nodemailer from 'nodemailer';
 import { runMigrations } from '../db/migrate';
-import { processEmailJob } from '../workers/emailWorker';
+import { processEmailJob, initializeWorker } from '../workers/emailWorker';
 import { getDelivery, claimDelivery, reconcileStaleDeliveries } from '../services/deliveryService';
 import { clearTransporterCache, setDefaultTransporter, resetDefaultTransporter } from '../services/emailService';
 import { safeEncrypt } from '../utils/crypto';
@@ -955,132 +955,152 @@ async function runBatch3Verification(): Promise<void> {
       assert(parseInt(a12Count.rows[0].cnt, 10) === 1, 'ZERO new attempts created (attempt_count remains 1)');
 
       // ======================================================================
-      // SCENARIO 13: Stale claim reconciliation after PostgreSQL outage (Batch 3.2 Bug 1)
-      //   Tests 1-6: SMTP acceptance → DB outage → lease expires → reconciliation → verify unknown
+      // SCENARIO 13: Stale claim reconciliation after actual PostgreSQL outage (Batch 3.3)
+      //   Simulates SMTP acceptance followed by real PostgreSQL connection termination.
+      //   Zero manual status editing.
       // ======================================================================
       console.log('\n' + SUB_SEP);
-      console.log('SCENARIO 13: Stale claim reconciliation after PostgreSQL outage');
+      console.log('SCENARIO 13: Stale claim reconciliation after actual PostgreSQL outage');
       console.log(SUB_SEP);
 
       clearTransporterCache();
       smtpControl.mode = 'normal';
-      const staleMsgId = '<stale-claim-accepted-321@reachinbox.test>';
+      const staleMsgId = '<stale-outage-accepted-555@reachinbox.test>';
       smtpControl.assignedMessageId = staleMsgId;
       smtpControl.sessions = [];
 
-      const sender13Id = await createTestSender('Sender Stale', 'stale@sender.test', 'user_stale', 'pass');
+      const sender13Id = await createTestSender('Sender Stale Outage', 'stale_outage@sender.test', 'user_stale', 'pass');
       const c13 = await testClient.query(`
         INSERT INTO campaigns (user_id, sender_id, subject, body, status)
-        VALUES ($1, $2, 'Stale Claim Test', 'Body', 'sending') RETURNING id;
+        VALUES ($1, $2, 'Actual Outage Reconciliation Test', 'Body', 'sending') RETURNING id;
       `, [userId, sender13Id]);
       const c13Id = c13.rows[0].id;
-      const r13Id = await createTestRecip(c13Id, 'stale_recip@reachinbox.test');
+      const r13Id = await createTestRecip(c13Id, 'real_outage_recip@reachinbox.test');
 
-      // Step 1: Simulate SMTP acceptance followed by DB persistence failure
+      // 1. Dedicated worker client that will suffer connection termination
+      const outageWorkerClient = await testPool.connect();
+      outageWorkerClient.on('error', () => {
+        // Expected socket/connection error when terminated
+      });
+      const outageClientPid = Number(outageWorkerClient.processID);
+
+      // 2. Worker executes job on outageWorkerClient with 1.2s lease duration
+      //    Immediately upon confirmed SMTP acceptance, onSmtpAccepted terminates the PostgreSQL backend connection!
       let c13Thrown = false;
       try {
         await processEmailJob(
           {
-            id: `job_scenario_13_${c13Id}`,
+            id: `job_scenario_13_outage_${c13Id}`,
             data: {
               campaignId: c13Id,
               recipientId: r13Id,
-              simulateDbFailureAfterSend: true,
+              leaseDurationMs: 1200,
+              onSmtpAccepted: async () => {
+                console.log(`   💥 Simulating real PostgreSQL connection loss: terminating backend PID ${outageClientPid}...`);
+                await adminClient.query(`SELECT pg_terminate_backend(${outageClientPid});`);
+                // Short wait to allow socket to close
+                await new Promise((r) => setTimeout(r, 150));
+              },
             },
             attemptsMade: 0,
           },
-          testPool
+          outageWorkerClient
         );
       } catch {
         c13Thrown = true;
       }
-      assert(!c13Thrown, 'Worker does NOT rethrow on post-acceptance DB failure');
 
-      // Count initial SMTP sends (should be exactly 1)
+      assert(!c13Thrown, 'Worker does NOT crash or rethrow when database connection drops after send');
+
+      // Discard broken client
+      try { outageWorkerClient.release(true); } catch {}
+
+      // Verify SMTP server received exactly one submission
       const staleSmtpCount1 = smtpControl.sessions.filter(
-        (s) => s.rcptTo?.includes('stale_recip@reachinbox.test') && s.dataLines?.length > 0
+        (s) => s.rcptTo?.includes('real_outage_recip@reachinbox.test') && s.dataLines?.length > 0
       ).length;
-      assert(staleSmtpCount1 === 1, 'SMTP server received exactly one submission');
+      assert(staleSmtpCount1 === 1, 'SMTP server received exactly one submission before DB outage');
 
-      // Delivery should already be 'unknown' from recordPostgresPersistenceFailure
-      const d13a = await getDelivery(c13Id, r13Id, testClient);
-      assert(d13a!.status === 'unknown', 'Delivery is in non-dispatchable \"unknown\" state after DB persistence failure');
+      // 3. Connect via restored, healthy database client
+      const restoredClient = await testPool.connect();
+      try {
+        // Verify state immediately after outage: delivery was left in 'sending' and attempt in 'attempting'
+        // (proven by real DB state, without ANY manual SQL updates)
+        const dPreRecon = await getDelivery(c13Id, r13Id, restoredClient);
+        assert(
+          dPreRecon !== null && dPreRecon.status === 'sending',
+          'Delivery was left in "sending" status by real database outage (zero manual SQL editing)'
+        );
 
-      // Step 2: Simulate a scenario where delivery stayed in 'sending' (the more dangerous case):
-      // Directly put delivery back to 'sending' with an EXPIRED lease to simulate a crash
-      // where recordPostgresPersistenceFailure never executed
-      await testClient.query(
-        `UPDATE email_deliveries
-         SET status = 'sending',
-             claim_owner = 'crashed_worker_1234',
-             lease_expires_at = NOW() - INTERVAL '5 minutes',
-             last_error = NULL,
-             updated_at = NOW()
-         WHERE id = $1`,
-        [d13a!.id]
-      );
-      // Also put the attempt back to 'attempting' to simulate the crash scenario
-      await testClient.query(
-        `UPDATE email_attempts
-         SET status = 'attempting',
-             error_classification = NULL,
-             error_message = NULL,
-             completed_at = NULL
-         WHERE delivery_id = $1`,
-        [d13a!.id]
-      );
+        const aPreRecon = await restoredClient.query(
+          `SELECT * FROM email_attempts WHERE delivery_id = $1 ORDER BY attempt_number DESC LIMIT 1;`,
+          [dPreRecon!.id]
+        );
+        assert(
+          aPreRecon.rows.length > 0 && aPreRecon.rows[0].status === 'attempting',
+          'Attempt history was left in "attempting" status by real database outage'
+        );
 
-      // Step 3: Run stale-delivery reconciliation
-      console.log('   Running stale claim reconciliation...');
-      const reconResult = await reconcileStaleDeliveries(testPool);
-      assert(reconResult.reconciledCount >= 1, 'Reconciliation found and processed stale delivery');
-      assert(reconResult.reconciledIds.includes(d13a!.id), 'Stale delivery ID included in reconciled set');
+        // 4. Wait for the 1.2s delivery lease to expire
+        console.log('   Waiting for delivery lease to expire (1.3s)...');
+        await new Promise((r) => setTimeout(r, 1300));
 
-      // Step 4: Verify delivery is now 'unknown', NOT 'pending' or 'sending'
-      const d13b = await getDelivery(c13Id, r13Id, testClient);
-      assert(d13b!.status === 'unknown', 'Delivery transitioned to \"unknown\" (not pending or sending) after reconciliation');
-      assert(d13b!.claim_owner === null, 'Claim owner cleared by reconciliation');
-      assert(d13b!.lease_expires_at === null, 'Lease expiry cleared by reconciliation');
-      assert(
-        d13b!.last_error !== null && d13b!.last_error.includes('Stale claim reconciliation'),
-        'Last error records reconciliation context'
-      );
+        // 5. Run runtime stale-delivery reconciliation mechanism
+        console.log('   Running runtime stale delivery reconciliation...');
+        const reconResult = await reconcileStaleDeliveries(restoredClient);
+        assert(reconResult.reconciledCount >= 1, 'Runtime reconciliation identified and processed stale delivery');
+        assert(reconResult.reconciledIds.includes(dPreRecon!.id), 'Stale delivery ID was included in reconciled set');
 
-      // Verify attempt record updated
-      const a13 = await testClient.query(
-        `SELECT * FROM email_attempts WHERE delivery_id = $1 ORDER BY attempt_number DESC LIMIT 1;`,
-        [d13a!.id]
-      );
-      assert(a13.rows[0].status === 'unknown', 'Attempt transitioned to \"unknown\" by reconciliation');
-      assert(a13.rows[0].error_classification === 'stale_claim_reconciliation', 'Classification is \"stale_claim_reconciliation\"');
+        // 6. Verify delivery becomes 'unknown' (not 'pending' or 'sending')
+        const d13b = await getDelivery(c13Id, r13Id, restoredClient);
+        assert(d13b!.status === 'unknown', 'Delivery transitioned to "unknown" (not pending or sending) after reconciliation');
+        assert(d13b!.claim_owner === null, 'Claim owner cleared by reconciliation');
+        assert(d13b!.lease_expires_at === null, 'Lease expiry cleared by reconciliation');
+        assert(
+          d13b!.last_error !== null && d13b!.last_error.includes('Stale claim reconciliation'),
+          'Last error records stale claim reconciliation context'
+        );
 
-      // Step 5: Verify a second worker cannot claim or resend
-      const staleClaim = await claimDelivery({
-        campaignId: c13Id,
-        recipientId: r13Id,
-        claimOwner: 'worker_post_reconciliation',
-        leaseDurationMs: 60000,
-        dbClient: testClient,
-      });
-      assert(staleClaim === null, 'Post-reconciliation claim returns NULL (delivery is non-dispatchable)');
+        // 7. Verify attempt history becomes 'unknown'
+        const a13 = await restoredClient.query(
+          `SELECT * FROM email_attempts WHERE delivery_id = $1 ORDER BY attempt_number DESC LIMIT 1;`,
+          [dPreRecon!.id]
+        );
+        assert(a13.rows[0].status === 'unknown', 'Attempt history transitioned to "unknown"');
+        assert(
+          a13.rows[0].error_classification === 'stale_claim_reconciliation',
+          'Attempt error classification is "stale_claim_reconciliation"'
+        );
 
-      // Also verify processEmailJob skips it
-      await processEmailJob(
-        {
-          id: `job_scenario_13_retry_${c13Id}`,
-          data: { campaignId: c13Id, recipientId: r13Id },
-          attemptsMade: 1,
-        },
-        testPool
-      );
-      const d13c = await getDelivery(c13Id, r13Id, testClient);
-      assert(d13c!.status === 'unknown', 'Worker skips \"unknown\" delivery (never resent)');
+        // 8. Verify subsequent BullMQ job cannot send the same email again
+        await processEmailJob(
+          {
+            id: `job_scenario_13_subsequent_${c13Id}`,
+            data: { campaignId: c13Id, recipientId: r13Id },
+            attemptsMade: 1,
+          },
+          restoredClient
+        );
+        const d13c = await getDelivery(c13Id, r13Id, restoredClient);
+        assert(d13c!.status === 'unknown', 'Subsequent worker skips "unknown" delivery without sending');
 
-      // Step 6: Verify SMTP server received exactly one submission (zero duplicates)
-      const staleSmtpCount2 = smtpControl.sessions.filter(
-        (s) => s.rcptTo?.includes('stale_recip@reachinbox.test') && s.dataLines?.length > 0
-      ).length;
-      assert(staleSmtpCount2 === 1, 'SMTP received exactly one submission total (zero duplicates after reconciliation)');
+        const secondClaim = await claimDelivery({
+          campaignId: c13Id,
+          recipientId: r13Id,
+          claimOwner: 'worker_probe_second',
+          leaseDurationMs: 60000,
+          dbClient: restoredClient,
+        });
+        assert(secondClaim === null, 'Second worker cannot claim reconciled "unknown" delivery');
+
+        // 9. Verify SMTP test server received ONLY ONE submission (zero duplicate sends)
+        const staleSmtpCount2 = smtpControl.sessions.filter(
+          (s) => s.rcptTo?.includes('real_outage_recip@reachinbox.test') && s.dataLines?.length > 0
+        ).length;
+        assert(staleSmtpCount2 === 1, 'SMTP server received strictly one submission in total (zero duplicates)');
+      } finally {
+        restoredClient.release();
+      }
 
       // ======================================================================
       // SCENARIO 14: SMTP response code metadata correctness (Batch 3.2 Bug 2)
