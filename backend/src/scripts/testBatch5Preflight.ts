@@ -720,6 +720,321 @@ another_bad@,Bad 2`;
       );
       assert(res400Date.getCode() === 400, 'Invalid scheduled_at responds with 400');
 
+      // =====================================================================
+      // BATCH 5.1 ACCEPTANCE TESTS
+      // =====================================================================
+
+      // ---------------------------------------------------------------------
+      // TEST 13: Client Cannot Override Actual Configured Campaign Capacity
+      // ---------------------------------------------------------------------
+      console.log('\n' + SUB_SEP);
+      console.log('TEST 13: Client Cannot Override Actual Configured Campaign Capacity (Bug 1)');
+      console.log(SUB_SEP);
+
+      // Campaign A has hourly_limit = 10 in PostgreSQL.
+      // Client passes hourly_limit = 500 in the preflight request.
+      const overrideAttempt = await runPreflight(
+        {
+          userId: userAId,
+          campaignId: campaignAId,
+          senderId: senderAId,
+          hourlyLimit: 500, // Client attempts to override configured limit of 10
+          content: 'email,name\ntest1@reachinbox.test,Test 1',
+        },
+        testClient,
+        redis
+      );
+
+      assert(
+        overrideAttempt.capacity.campaign.hourly_limit === 10,
+        'Configured campaign limit (10) cannot be overridden by client hourly_limit parameter'
+      );
+      assert(
+        overrideAttempt.capacity.effective_hourly_rate === 10,
+        'Effective hourly rate remains 10 (not 500)'
+      );
+      assert(
+        overrideAttempt.what_if_scenario !== null &&
+          overrideAttempt.what_if_scenario?.simulated_hourly_limit === 500,
+        'Client parameter is exposed as an isolated what_if_scenario without altering actual capacity'
+      );
+
+      // ---------------------------------------------------------------------
+      // TEST 14: Campaign Limit Comes Directly From PostgreSQL
+      // ---------------------------------------------------------------------
+      console.log('\n' + SUB_SEP);
+      console.log('TEST 14: Campaign Limit Derived Authoritatively From PostgreSQL');
+      console.log(SUB_SEP);
+
+      await testClient.query(
+        `UPDATE campaigns SET hourly_limit = 35 WHERE id = $1`,
+        [campaignAId]
+      );
+
+      const dbCampaignRes = await runPreflight(
+        {
+          userId: userAId,
+          campaignId: campaignAId,
+          senderId: senderAId,
+          content: 'email,name\ntest1@reachinbox.test,Test 1',
+        },
+        testClient,
+        redis
+      );
+
+      assert(
+        dbCampaignRes.capacity.campaign.hourly_limit === 35,
+        'Campaign limit authoritatively reflects updated PostgreSQL record (35)'
+      );
+      assert(
+        dbCampaignRes.capacity.effective_hourly_rate === 35,
+        'Effective hourly rate reflects PostgreSQL campaign limit (35)'
+      );
+
+      // ---------------------------------------------------------------------
+      // TEST 15: Sender Limit Comes Directly From PostgreSQL
+      // ---------------------------------------------------------------------
+      console.log('\n' + SUB_SEP);
+      console.log('TEST 15: Sender Limit Derived Authoritatively From PostgreSQL');
+      console.log(SUB_SEP);
+
+      await testClient.query(
+        `UPDATE senders SET hourly_limit = 85 WHERE id = $1`,
+        [senderAId]
+      );
+
+      const dbSenderRes = await runPreflight(
+        {
+          userId: userAId,
+          campaignId: campaignAId,
+          senderId: senderAId,
+          content: 'email,name\ntest1@reachinbox.test,Test 1',
+        },
+        testClient,
+        redis
+      );
+
+      assert(
+        dbSenderRes.capacity.sender.hourly_limit === 85,
+        'Sender limit authoritatively reflects updated PostgreSQL record (85)'
+      );
+
+      // ---------------------------------------------------------------------
+      // TEST 16: Campaign Limit Exhausted While Sender Limit Is Not (Bug 2)
+      // ---------------------------------------------------------------------
+      console.log('\n' + SUB_SEP);
+      console.log('TEST 16: Campaign Limit Exhausted (Unrelated Sender TTL Excluded)');
+      console.log(SUB_SEP);
+
+      // Clean test rate-limit keys
+      await redis.del(`rate-limit:campaign:${campaignAId}`);
+      await redis.del(`rate-limit:sender:${senderAId}`);
+
+      // Campaign A (limit 35) is EXHAUSTED: 35 used, remaining 0, TTL = 1800s
+      await redis.set(`rate-limit:campaign:${campaignAId}`, '35', 'EX', 1800);
+      // Sender A (limit 85) is NOT exhausted: 20 used, remaining 65, TTL = 500s
+      await redis.set(`rate-limit:sender:${senderAId}`, '20', 'EX', 500);
+
+      const capExhaustedCamp = await calculateCapacityAndForecast(
+        {
+          userId: userAId,
+          campaignId: campaignAId,
+          senderId: senderAId,
+          recipientCount: 5,
+        },
+        testClient,
+        redis
+      );
+
+      assert(
+        capExhaustedCamp.capacity.campaign.remaining_hourly === 0,
+        'Campaign remaining capacity is 0 (exhausted)'
+      );
+      assert(
+        capExhaustedCamp.capacity.sender.remaining_hourly === 65,
+        'Sender remaining capacity is 65 (not exhausted)'
+      );
+      assert(
+        capExhaustedCamp.forecast.estimated_duration_seconds >= 1800,
+        'Reset waiting time uses campaign TTL (1800s), NOT unrelated sender TTL (500s)'
+      );
+      assert(
+        capExhaustedCamp.forecast.warnings.some((w) => w.includes('campaign hourly limit')),
+        'Warning correctly identifies campaign hourly limit as the exhausted constraint'
+      );
+      assert(
+        !capExhaustedCamp.forecast.warnings.some((w) => w.includes('sender hourly limit')),
+        'Warning does not falsely identify sender hourly limit as exhausted'
+      );
+
+      // ---------------------------------------------------------------------
+      // TEST 17: Sender Limit Exhausted While Campaign Limit Is Not (Bug 2)
+      // ---------------------------------------------------------------------
+      console.log('\n' + SUB_SEP);
+      console.log('TEST 17: Sender Limit Exhausted (Unrelated Campaign TTL Excluded)');
+      console.log(SUB_SEP);
+
+      // Clean test rate-limit keys
+      await redis.del(`rate-limit:campaign:${campaignAId}`);
+      await redis.del(`rate-limit:sender:${senderAId}`);
+
+      // Campaign A (limit 35) is NOT exhausted: 10 used, remaining 25, TTL = 400s
+      await redis.set(`rate-limit:campaign:${campaignAId}`, '10', 'EX', 400);
+      // Sender A (limit 85) is EXHAUSTED: 85 used, remaining 0, TTL = 2200s
+      await redis.set(`rate-limit:sender:${senderAId}`, '85', 'EX', 2200);
+
+      const capExhaustedSender = await calculateCapacityAndForecast(
+        {
+          userId: userAId,
+          campaignId: campaignAId,
+          senderId: senderAId,
+          recipientCount: 5,
+        },
+        testClient,
+        redis
+      );
+
+      assert(
+        capExhaustedSender.capacity.sender.remaining_hourly === 0,
+        'Sender remaining capacity is 0 (exhausted)'
+      );
+      assert(
+        capExhaustedSender.capacity.campaign.remaining_hourly === 25,
+        'Campaign remaining capacity is 25 (not exhausted)'
+      );
+      assert(
+        capExhaustedSender.forecast.estimated_duration_seconds >= 2200,
+        'Reset waiting time uses sender TTL (2200s), NOT unrelated campaign TTL (400s)'
+      );
+      assert(
+        capExhaustedSender.forecast.warnings.some((w) => w.includes('sender hourly limit')),
+        'Warning correctly identifies sender hourly limit as the exhausted constraint'
+      );
+      assert(
+        !capExhaustedSender.forecast.warnings.some((w) => w.includes('campaign hourly limit')),
+        'Warning does not falsely identify campaign hourly limit as exhausted'
+      );
+
+      // ---------------------------------------------------------------------
+      // TEST 18: Multiple Limits Simultaneously Exhausted (Maximum TTL)
+      // ---------------------------------------------------------------------
+      console.log('\n' + SUB_SEP);
+      console.log('TEST 18: Multiple Exhausted Limits Require All Constraints to Reset');
+      console.log(SUB_SEP);
+
+      // Set global limit in env
+      process.env.GLOBAL_EMAILS_PER_HOUR = '100';
+
+      // Clean keys
+      await redis.del(`rate-limit:campaign:${campaignAId}`);
+      await redis.del(`rate-limit:sender:${senderAId}`);
+      await redis.del('rate-limit:global');
+
+      // Campaign exhausted with TTL = 1200s
+      await redis.set(`rate-limit:campaign:${campaignAId}`, '35', 'EX', 1200);
+      // Sender exhausted with TTL = 2500s
+      await redis.set(`rate-limit:sender:${senderAId}`, '85', 'EX', 2500);
+      // Global exhausted with TTL = 800s
+      await redis.set('rate-limit:global', '100', 'EX', 800);
+
+      const capMultiExhausted = await calculateCapacityAndForecast(
+        {
+          userId: userAId,
+          campaignId: campaignAId,
+          senderId: senderAId,
+          recipientCount: 5,
+        },
+        testClient,
+        redis
+      );
+
+      assert(
+        capMultiExhausted.capacity.campaign.remaining_hourly === 0,
+        'Campaign limit is exhausted'
+      );
+      assert(
+        capMultiExhausted.capacity.sender.remaining_hourly === 0,
+        'Sender limit is exhausted'
+      );
+      assert(
+        capMultiExhausted.capacity.global.remaining_hourly === 0,
+        'Global limit is exhausted'
+      );
+      assert(
+        capMultiExhausted.forecast.estimated_duration_seconds >= 2500,
+        'Reset waiting time accounts for when ALL required constraints permit sending (max TTL = 2500s)'
+      );
+      assert(
+        capMultiExhausted.forecast.warnings[0]?.includes('campaign hourly limit') &&
+          capMultiExhausted.forecast.warnings[0]?.includes('sender hourly limit') &&
+          capMultiExhausted.forecast.warnings[0]?.includes('global hourly limit'),
+        'Warning includes all three simultaneously exhausted constraints'
+      );
+
+      // Clean up global limit env
+      delete process.env.GLOBAL_EMAILS_PER_HOUR;
+
+      // ---------------------------------------------------------------------
+      // TEST 19: Spillover Reset Estimation Uses Exhausted Constraint TTL
+      // ---------------------------------------------------------------------
+      console.log('\n' + SUB_SEP);
+      console.log('TEST 19: Spillover Reset Estimation Accounts for Exhausted Constraint');
+      console.log(SUB_SEP);
+
+      // Clean keys
+      await redis.del(`rate-limit:campaign:${campaignAId}`);
+      await redis.del(`rate-limit:sender:${senderAId}`);
+
+      // Campaign A has 5 remaining (used 30 of 35), TTL = 1500s
+      await redis.set(`rate-limit:campaign:${campaignAId}`, '30', 'EX', 1500);
+      // Sender A has 25 remaining (used 60 of 85), TTL = 600s
+      await redis.set(`rate-limit:sender:${senderAId}`, '60', 'EX', 600);
+
+      // Batch of 20 emails: 5 sent in hour 1 (exhausting campaign limit), 15 spill over
+      const capSpillover = await calculateCapacityAndForecast(
+        {
+          userId: userAId,
+          campaignId: campaignAId,
+          senderId: senderAId,
+          recipientCount: 20,
+        },
+        testClient,
+        redis
+      );
+
+      assert(
+        capSpillover.forecast.estimated_duration_seconds >= 1500,
+        'Spillover waiting time accounts for campaign TTL (1500s) that becomes exhausted, not sender TTL (600s)'
+      );
+      assert(
+        capSpillover.forecast.warnings.some((w) => w.includes('campaign hourly limit')),
+        'Warning identifies campaign hourly limit as the spillover constraint'
+      );
+
+      // ---------------------------------------------------------------------
+      // TEST 20: Accurate Email Format Validation Description
+      // ---------------------------------------------------------------------
+      console.log('\n' + SUB_SEP);
+      console.log('TEST 20: Accurate Email Format Validation Description (No RFC 5322 claim)');
+      console.log(SUB_SEP);
+
+      const valDesc = await validateRecipients(
+        {
+          userId: userAId,
+          rawContent: 'email,name\nbad-email,Bad',
+        },
+        testClient
+      );
+
+      assert(
+        valDesc.invalid[0]?.reason === 'Invalid email address format',
+        'Email validation error accurately describes format validation'
+      );
+      assert(
+        !valDesc.invalid[0]?.reason.includes('RFC 5322'),
+        'API does not make unsupported full RFC 5322 compliance claims'
+      );
+
     } finally {
       testClient.release();
       await testPool.end();

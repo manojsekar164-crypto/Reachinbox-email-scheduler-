@@ -691,3 +691,54 @@ Awaiting explicit operator authorization.
 | Batch 1 Regression Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
 | TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
 | Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched |
+
+
+---
+
+## [Entry 013] - 2026-11-17 - Phase 1 Batch 5.1: Preflight Forecast Accuracy
+
+**Scope:** Batch 5.1 – Preflight Forecast Accuracy & PostgreSQL Limit Integrity
+**Branch:** `feat/database-foundation`
+**Starting Baseline Commit:** `0a31a22`
+**Engineer:** Senior Backend Engineer
+
+### Implementation Summary
+
+1. **Authoritative PostgreSQL Limit Derivation (Bug 1 Fix):**
+   - Refactored `calculateCapacityAndForecast()` in `src/services/preflightService.ts` to derive sender and campaign limits strictly from authenticated PostgreSQL records (`senders` and `campaigns` tables).
+   - Removed vulnerability where a client-supplied `hourly_limit` parameter could silently overwrite an existing campaign's configured limit.
+   - Preserved `hourly_limit` strictly for pre-creation draft campaigns that have no existing database record.
+   - Exposes client-supplied parameter on existing campaigns as an isolated `what_if_scenario` simulation (`WhatIfScenarioResult`) without misrepresenting actual configured capacity.
+
+2. **Accurate Rate-Limit Reset Estimation (Bug 2 Fix):**
+   - Implemented `calculateResetWait()` in `src/services/preflightService.ts`:
+     - Inspects each applicable rate limit counter (campaign, sender, global) to identify specifically which constraint(s) are currently exhausted or will become exhausted mid-batch (spillover).
+     - Calculates reset wait duration using strictly the relevant exhausted counters, completely eliminating the flawed `Math.min()` of unrelated non-exhausted counters.
+     - When multiple limits are simultaneously exhausted, computes the maximum TTL across all exhausted constraints, ensuring dispatches resume only after all required constraints permit sending.
+     - Updates warning messages to dynamically specify the exact exhausted constraint(s).
+
+3. **Accurate Validation Error Description:**
+   - Updated email format validation error reason from `'Invalid email address format (RFC 5322 violation)'` to `'Invalid email address format'`, removing unverified claims of full RFC 5322 compliance.
+
+4. **Batch 5.1 Acceptance Tests (`src/scripts/testBatch5Preflight.ts`):**
+   - Added Tests 13–20 verifying:
+     - Client cannot override actual configured campaign capacity (500 limit ignored, 10 maintained).
+     - Campaign limit derived directly from PostgreSQL updates (35).
+     - Sender limit derived directly from PostgreSQL updates (85).
+     - Campaign limit exhausted while sender is not (uses 1800s campaign TTL, excludes 500s sender TTL).
+     - Sender limit exhausted while campaign is not (uses 2200s sender TTL, excludes 400s campaign TTL).
+     - Multiple limits exhausted simultaneously (uses max TTL = 2500s across 1200s, 2500s, 800s).
+     - Spillover reset estimation correctly identifies exhausted constraint.
+     - Accurate email format validation description without RFC 5322 claims.
+
+### Actual Test Results
+
+| Test Suite | Command | Result | Notes |
+|---|---|---|---|
+| Batch 5.1 Verification Suite | `npm run batch5:test` | ✅ PASS | 115/115 assertions passed across all 20 test sections |
+| Batch 4 Regression Suite | `npm run batch4:test` | ✅ PASS | 51/51 assertions passed across all 10 scenarios |
+| Batch 3 Regression Suite | `npm run batch3:test` | ✅ PASS | 96/96 assertions passed across all 14 scenarios |
+| Batch 2 Regression Suite | `npm run batch2:test` | ✅ PASS | 25/25 assertions passed across all 9 outbox/persistence scenarios |
+| Batch 1 Regression Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
+| TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
+| Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched |

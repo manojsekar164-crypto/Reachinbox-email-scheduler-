@@ -6,19 +6,20 @@
  * Responsibilities:
  *  1. Recipient Validation Engine:
  *     - CSV and text recipient parsing (with BOM stripping, quote handling, and delimiter detection).
- *     - Email format validation using project conventions.
+ *     - Standard email format validation.
  *     - Duplicate detection within uploaded data (case-insensitive).
  *     - Existing-recipient detection within the selected campaign (PostgreSQL check).
  *     - Row-level validation errors with informative reasons.
  *     - Summary counts (valid, invalid, duplicate, existing).
  *     - Safe handling of empty files, malformed syntax, missing email columns, and oversized uploads.
  *  2. Sender Capacity and Delivery Forecast Engine:
- *     - Sender-specific hourly capacity & remaining quota.
+ *     - Sender-specific hourly capacity & remaining quota strictly from PostgreSQL.
+ *     - Campaign-specific hourly capacity & remaining quota strictly from PostgreSQL.
  *     - Global hourly capacity & remaining quota (disabled if 0).
- *     - Campaign-specific hourly capacity & remaining quota.
  *     - Minimum spacing constraint & theoretical max rate.
  *     - Queue backlog inspection (BullMQ active/waiting jobs).
- *     - Bottleneck detection & multi-hour delivery time forecasting.
+ *     - Accurate reset wait estimation for exhausted limits (accounting for all required constraints).
+ *     - Optional What-If forecasting scenario without mutating actual configured capacity.
  *
  * Invariants:
  *  - 100% READ-ONLY: Never inserts/modifies recipients, deliveries, attempts, outbox, or campaigns.
@@ -43,6 +44,7 @@ import {
   RecipientValidationResult,
   PreflightCapacityResult,
   DeliveryForecastResult,
+  WhatIfScenarioResult,
   PreflightResult,
   RunPreflightInput,
   RecipientInputItem,
@@ -50,7 +52,7 @@ import {
 } from '../types/preflight.types';
 import { SenderRow, CampaignRow } from '../types/db.types';
 
-// Standard project RFC 5322 compatible email format regex
+// Standard project email format validation regex
 export const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export const DEFAULT_MAX_UPLOAD_SIZE = 5 * 1024 * 1024; // 5 MB
@@ -62,12 +64,6 @@ export function isValidEmailFormat(email: string): boolean {
 // ---------------------------------------------------------------------------
 // CSV / Text Parser Implementation
 // ---------------------------------------------------------------------------
-
-interface ParsedTokenRow {
-  rowNumber: number;
-  tokens: string[];
-  raw: string;
-}
 
 /**
  * Splits a single CSV/delimited line into string tokens, handling quotes and commas/semicolons.
@@ -404,12 +400,12 @@ export async function validateRecipients(
       continue;
     }
 
-    // Check email syntax
+    // Check email syntax (Accurate description: standard email address format)
     if (!isValidEmailFormat(normalizedEmail)) {
       invalid.push({
         row: item.rowNumber,
         email: rawEmail,
-        reason: 'Invalid email address format (RFC 5322 violation)',
+        reason: 'Invalid email address format',
         raw: item.raw,
       });
       continue;
@@ -465,7 +461,84 @@ export async function validateRecipients(
 }
 
 // ---------------------------------------------------------------------------
-// Sender Capacity & Delivery Forecast Engine
+// Rate-Limit Reset Estimation Engine (Bug 2 Fix)
+// ---------------------------------------------------------------------------
+
+export interface ResetWaitResult {
+  resetWaitMs: number;
+  exhaustedConstraints: BottleneckReason[];
+}
+
+/**
+ * Accurately determines which constraints are exhausted and calculates the
+ * required reset waiting time using the maximum TTL of all exhausted constraints.
+ *
+ * Invariant: Never uses the minimum TTL of unrelated non-exhausted counters.
+ */
+export function calculateResetWait(
+  currentHourRemaining: number,
+  recipientCount: number,
+  constraints: {
+    campaign: { remaining: number; ttlSeconds: number };
+    sender: { remaining: number; ttlSeconds: number };
+    global: { enabled: boolean; remaining: number | null; ttlSeconds: number };
+  }
+): ResetWaitResult {
+  const exhaustedConstraints: BottleneckReason[] = [];
+  const relevantTtls: number[] = [];
+
+  if (currentHourRemaining <= 0) {
+    // Current hour is already blocked before any sends in this batch
+    if (constraints.campaign.remaining <= 0) {
+      exhaustedConstraints.push('campaign_hourly_limit');
+      relevantTtls.push(constraints.campaign.ttlSeconds);
+    }
+    if (constraints.sender.remaining <= 0) {
+      exhaustedConstraints.push('sender_hourly_limit');
+      relevantTtls.push(constraints.sender.ttlSeconds);
+    }
+    if (
+      constraints.global.enabled &&
+      constraints.global.remaining !== null &&
+      constraints.global.remaining <= 0
+    ) {
+      exhaustedConstraints.push('global_hourly_limit');
+      relevantTtls.push(constraints.global.ttlSeconds);
+    }
+  } else if (recipientCount > currentHourRemaining) {
+    // Spillover: current batch sends currentHourRemaining in hour 1, exhausting any constraint whose remaining === currentHourRemaining
+    if (constraints.campaign.remaining === currentHourRemaining) {
+      exhaustedConstraints.push('campaign_hourly_limit');
+      relevantTtls.push(constraints.campaign.ttlSeconds);
+    }
+    if (constraints.sender.remaining === currentHourRemaining) {
+      exhaustedConstraints.push('sender_hourly_limit');
+      relevantTtls.push(constraints.sender.ttlSeconds);
+    }
+    if (
+      constraints.global.enabled &&
+      constraints.global.remaining !== null &&
+      constraints.global.remaining === currentHourRemaining
+    ) {
+      exhaustedConstraints.push('global_hourly_limit');
+      relevantTtls.push(constraints.global.ttlSeconds);
+    }
+  }
+
+  if (relevantTtls.length === 0) {
+    return { resetWaitMs: 0, exhaustedConstraints: [] };
+  }
+
+  // To allow sending, ALL exhausted constraints must permit sending -> maximum of relevant TTLs
+  const maxTtlSec = Math.max(...relevantTtls);
+  return {
+    resetWaitMs: maxTtlSec * 1000,
+    exhaustedConstraints,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Sender Capacity & Delivery Forecast Engine (Bug 1 & 2 Fixes)
 // ---------------------------------------------------------------------------
 
 export interface CalculateCapacityOptions {
@@ -481,16 +554,24 @@ export interface CalculateCapacityOptions {
  * Calculates real-time sender, campaign, global, and spacing capacity,
  * and generates an approximate multi-hour delivery completion forecast.
  *
- * Invariant: 100% read-only. Does NOT reserve Redis rate-limit tokens or publish jobs.
+ * Invariants:
+ *  - Actual configured capacity strictly derived from authorized PostgreSQL records.
+ *  - Client-supplied hourly_limit cannot overwrite configured campaign limit.
+ *  - If what-if simulation is provided, it is exposed as a separate scenario.
+ *  - 100% read-only.
  */
 export async function calculateCapacityAndForecast(
   options: CalculateCapacityOptions,
   dbClient: Pool | Client = db,
   redisClient: Redis = defaultRedis
-): Promise<{ capacity: PreflightCapacityResult; forecast: DeliveryForecastResult }> {
+): Promise<{
+  capacity: PreflightCapacityResult;
+  forecast: DeliveryForecastResult;
+  whatIfScenario?: WhatIfScenarioResult | null;
+}> {
   const { userId, senderId, campaignId, hourlyLimit, scheduledAt, recipientCount } = options;
 
-  // 1. Fetch & Verify Sender
+  // 1. Fetch & Verify Sender strictly from PostgreSQL
   const senderRes = await dbClient.query<SenderRow>(
     `SELECT * FROM senders WHERE id = $1 AND user_id = $2`,
     [senderId, userId]
@@ -500,20 +581,27 @@ export async function calculateCapacityAndForecast(
     throw new Error(`Sender not found or access denied (${senderId})`);
   }
   const sender = senderRes.rows[0]!;
+  // Sender limit strictly derived from PostgreSQL record
   const senderLimit = sender.hourly_limit && sender.hourly_limit > 0 ? sender.hourly_limit : 100;
 
-  // 2. Fetch Campaign (if campaignId is provided)
-  let campaignLimit = 5; // default fallback
+  // 2. Fetch Campaign strictly from PostgreSQL (Bug 1 Fix)
+  let campaignLimit = 5; // default fallback for new campaign drafts
+  let isExistingCampaign = false;
+
   if (campaignId) {
     const campRes = await dbClient.query<CampaignRow>(
       `SELECT * FROM campaigns WHERE id = $1 AND user_id = $2`,
       [campaignId, userId]
     );
-    if (campRes.rows.length > 0 && campRes.rows[0]!.hourly_limit) {
-      campaignLimit = campRes.rows[0]!.hourly_limit;
+    if (campRes.rows.length === 0) {
+      throw new Error(`Campaign not found or access denied (${campaignId})`);
     }
-  }
-  if (hourlyLimit && Number.isInteger(hourlyLimit) && hourlyLimit > 0) {
+    const campaign = campRes.rows[0]!;
+    // Configure limit strictly from PostgreSQL record (never overridden by client param)
+    campaignLimit = campaign.hourly_limit && campaign.hourly_limit > 0 ? campaign.hourly_limit : 5;
+    isExistingCampaign = true;
+  } else if (hourlyLimit && Number.isInteger(hourlyLimit) && hourlyLimit > 0) {
+    // Only pre-creation drafts without an existing campaign record use the requested limit
     campaignLimit = hourlyLimit;
   }
 
@@ -568,7 +656,6 @@ export async function calculateCapacityAndForecast(
     const counts = await emailQueue.getJobCounts('waiting', 'active');
     queuedJobsCount = (counts['waiting'] || 0) + (counts['active'] || 0);
   } catch (err: any) {
-    // Graceful fallback if BullMQ queue query is unavailable during test/standalone
     queuedJobsCount = 0;
   }
 
@@ -628,7 +715,7 @@ export async function calculateCapacityAndForecast(
     primary_bottleneck: primaryBottleneck,
   };
 
-  // 9. Delivery Forecast Calculation
+  // 9. Delivery Forecast Calculation (Bug 2 Fix)
   const N = recipientCount;
   let startMs = now;
 
@@ -652,6 +739,12 @@ export async function calculateCapacityAndForecast(
   ];
   const warnings: string[] = [];
 
+  const resetWaitInfo = calculateResetWait(currentHourRemaining, N, {
+    campaign: { remaining: campaignRemaining, ttlSeconds: campaignTtlSeconds },
+    sender: { remaining: senderRemaining, ttlSeconds: senderTtlSeconds },
+    global: { enabled: globalEnabled, remaining: globalRemaining, ttlSeconds: globalTtlSeconds },
+  });
+
   if (N === 0) {
     durationMs = 0;
   } else {
@@ -659,18 +752,20 @@ export async function calculateCapacityAndForecast(
     const spacingDurationMs = (N - 1) * sendDelayMs;
     const queueDelayMs = queuedJobsCount * sendDelayMs;
 
-    // Rate-limiting multi-hour estimation
     let rateDurationMs = 0;
 
     if (currentHourRemaining <= 0) {
-      // Entire batch must wait for the current window to reset
-      const resetWaitMs = Math.min(senderTtlSeconds, campaignTtlSeconds, globalTtlSeconds) * 1000;
+      // Entire batch must wait for all exhausted constraints to reset
+      const resetWaitMs = resetWaitInfo.resetWaitMs;
       const fullHours = Math.floor((N - 1) / effectiveHourlyRate);
       const remInLastHour = (N - 1) % effectiveHourlyRate;
       rateDurationMs = resetWaitMs + fullHours * 3600000 + remInLastHour * sendDelayMs;
 
+      const constraintNames = resetWaitInfo.exhaustedConstraints
+        .map((c) => c.replace(/_/g, ' '))
+        .join(' and ');
       warnings.push(
-        `Current hourly rate limit is exhausted for ${primaryBottleneck.replace(/_/g, ' ')}. ` +
+        `Current hourly rate limit is exhausted for ${constraintNames}. ` +
           `Deliveries will begin dispatching after window reset in approximately ${Math.ceil(resetWaitMs / 60000)} minutes.`
       );
     } else if (N <= currentHourRemaining) {
@@ -678,9 +773,9 @@ export async function calculateCapacityAndForecast(
       rateDurationMs = spacingDurationMs;
     } else {
       // Spillover into subsequent hours
+      const resetWaitMs = resetWaitInfo.resetWaitMs;
       const firstHourSent = currentHourRemaining;
       const spillover = N - firstHourSent;
-      const resetWaitMs = Math.min(senderTtlSeconds, campaignTtlSeconds, globalTtlSeconds) * 1000;
 
       const additionalFullHours = Math.floor((spillover - 1) / effectiveHourlyRate);
       const remInLastHour = ((spillover - 1) % effectiveHourlyRate) + 1;
@@ -690,9 +785,12 @@ export async function calculateCapacityAndForecast(
         additionalFullHours * 3600000 +
         (remInLastHour - 1) * sendDelayMs;
 
+      const constraintNames = resetWaitInfo.exhaustedConstraints
+        .map((c) => c.replace(/_/g, ' '))
+        .join(' and ');
       warnings.push(
         `Recipient count (${N}) exceeds current hour remaining capacity (${currentHourRemaining}). ` +
-          `Delivery will span multiple hours due to ${primaryBottleneck.replace(/_/g, ' ')} limit.`
+          `Delivery will span multiple hours due to ${constraintNames} limit.`
       );
     }
 
@@ -720,7 +818,58 @@ export async function calculateCapacityAndForecast(
     warnings,
   };
 
-  return { capacity, forecast };
+  // 10. Separate What-If Scenario Calculation (Bug 1 Fix)
+  let whatIfScenario: WhatIfScenarioResult | null = null;
+  if (
+    isExistingCampaign &&
+    hourlyLimit &&
+    Number.isInteger(hourlyLimit) &&
+    hourlyLimit > 0 &&
+    hourlyLimit !== campaignLimit
+  ) {
+    const simRates: Array<{ rate: number; reason: BottleneckReason }> = [
+      { rate: hourlyLimit, reason: 'campaign_hourly_limit' },
+      { rate: senderLimit, reason: 'sender_hourly_limit' },
+      { rate: maxSpacingHourlyRate, reason: 'minimum_spacing' },
+    ];
+    if (globalEnabled && globalLimit > 0) {
+      simRates.push({ rate: globalLimit, reason: 'global_hourly_limit' });
+    }
+    simRates.sort((a, b) => a.rate - b.rate);
+    const simEffectiveRate = simRates[0]!.rate;
+    const simBottleneck = simRates[0]!.reason;
+
+    let simDurationMs = 0;
+    if (N > 0) {
+      const spacingDurationMs = (N - 1) * sendDelayMs;
+      const simHourRemaining = Math.min(hourlyLimit, currentHourRemaining);
+      let simRateDurationMs = 0;
+
+      if (simHourRemaining <= 0) {
+        const fullHours = Math.floor((N - 1) / simEffectiveRate);
+        const rem = (N - 1) % simEffectiveRate;
+        simRateDurationMs = resetWaitInfo.resetWaitMs + fullHours * 3600000 + rem * sendDelayMs;
+      } else if (N <= simHourRemaining) {
+        simRateDurationMs = spacingDurationMs;
+      } else {
+        const spillover = N - simHourRemaining;
+        const fullHours = Math.floor((spillover - 1) / simEffectiveRate);
+        const rem = ((spillover - 1) % simEffectiveRate) + 1;
+        simRateDurationMs = resetWaitInfo.resetWaitMs + fullHours * 3600000 + (rem - 1) * sendDelayMs;
+      }
+      simDurationMs = Math.max(spacingDurationMs, simRateDurationMs) + queuedJobsCount * sendDelayMs;
+    }
+
+    whatIfScenario = {
+      simulated_hourly_limit: hourlyLimit,
+      effective_hourly_rate: simEffectiveRate,
+      primary_bottleneck: simBottleneck,
+      estimated_duration_seconds: Math.ceil(simDurationMs / 1000),
+      estimated_completion_at: new Date(startMs + simDurationMs).toISOString(),
+    };
+  }
+
+  return { capacity, forecast, whatIfScenario };
 }
 
 // ---------------------------------------------------------------------------
@@ -777,7 +926,7 @@ export async function runPreflight(
   );
 
   // 3. Sender Capacity & Forecast Engine
-  const { capacity, forecast } = await calculateCapacityAndForecast(
+  const { capacity, forecast, whatIfScenario } = await calculateCapacityAndForecast(
     {
       userId,
       senderId: effectiveSenderId,
@@ -795,5 +944,6 @@ export async function runPreflight(
     validation,
     capacity,
     forecast,
+    what_if_scenario: whatIfScenario || null,
   };
 }

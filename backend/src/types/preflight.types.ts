@@ -110,11 +110,20 @@ export interface DeliveryForecastResult {
   warnings: string[];
 }
 
+export interface WhatIfScenarioResult {
+  simulated_hourly_limit: number;
+  effective_hourly_rate: number;
+  primary_bottleneck: BottleneckReason;
+  estimated_duration_seconds: number;
+  estimated_completion_at: string;
+}
+
 export interface PreflightResult {
   success: boolean;
   validation: RecipientValidationResult;
   capacity: PreflightCapacityResult;
   forecast: DeliveryForecastResult;
+  what_if_scenario?: WhatIfScenarioResult | null;
 }
 
 export interface RecipientInputItem {
