@@ -1,4 +1,4 @@
-﻿# IMPLEMENTATION LOG — ReachInbox Email Delivery Platform
+# IMPLEMENTATION LOG — ReachInbox Email Delivery Platform
 
 ---
 
@@ -1016,6 +1016,54 @@ Refine the Operations Intelligence Data Service (`operationsIntelligenceService.
 | Test Suite | Command | Result | Notes |
 |---|---|---|---|
 | Batch 7A & 7A.1 Verification Suite | `npm run batch7a:test` | ✅ PASS | 104/104 assertions passed across all 15 test scenarios |
+| Batch 6 & 6.1 Verification Suite | `npm run batch6:test` | ✅ PASS | 108/108 assertions passed across all 19 test scenarios |
+| Batch 5 Verification Suite | `npm run batch5:test` | ✅ PASS | 142/142 assertions passed across all 21 test sections |
+| Batch 4 Regression Suite | `npm run batch4:test` | ✅ PASS | 51/51 assertions passed across all 10 scenarios |
+| Batch 3 Regression Suite | `npm run batch3:test` | ✅ PASS | 96/96 assertions passed across all 14 scenarios |
+| Batch 2 Regression Suite | `npm run batch2:test` | ✅ PASS | 25/25 assertions passed across all 9 outbox/persistence scenarios |
+| Batch 1 Regression Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
+| TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
+| Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched |
+
+---
+
+## 2026-11-17 – Entry 019: Batch 7A.2 – Shared Rate-Limit Privacy
+
+### Scope & Objective
+Protect shared global rate-limit telemetry and system-wide throughput metrics exposed to ordinary tenant users and the future AI Operations Copilot context in `operationsIntelligenceService.ts`:
+1. **Shared Rate-Limit Privacy**:
+   - Suppress exposure of exact global system-wide usage counts (`usage`) and usage/limit ratios (`usage / globalLimit`, e.g. `500/500`) to tenant responses.
+   - Prevent internal platform environment configuration names (`GLOBAL_EMAILS_PER_HOUR`) and system-wide throughput from leaking into operational facts or AI context documents.
+2. **Actionable Platform Throttling Alerts**:
+   - Preserve clear tenant notifications that shared platform throttling is active and outbound deliveries are temporarily delayed.
+   - Report tenant-safe operational recommendations: capacity resets hourly and dispatches resume automatically without manual intervention.
+3. **Tenant-Specific Information Preservation**:
+   - Maintain tenant-specific campaign hourly limit and sender hourly limit bottleneck metrics (`(${usage}/${limit} emails)`).
+   - Ensure queue counts remain strictly tenant-scoped (`global_counts: null`).
+4. **Strict Read-Only Verification**:
+   - All operational bottleneck evaluations remain strictly non-mutating.
+
+### Key Implementations & Enhancements
+1. **Tenant-Safe Bottleneck Telemetry (`operationsIntelligenceService.ts`)**:
+   - Updated `analyzeOperationalBottlenecks`:
+     - `observed_fact`: `'Shared platform hourly delivery capacity limit reached. Outbound dispatches are temporarily throttled.'`
+     - `calculated_indicator`: `'Outbound delivery dispatches are temporarily paused for ~${ttl} seconds until the shared capacity window resets.'`
+     - `recommendation`: `'Shared platform capacity resets hourly. Outbound dispatches will resume automatically; no tenant action required.'`
+   - Zero exposure of other tenants' activity or cumulative platform email volumes.
+2. **Verification Test Suite Expansion (`testBatch7AOperationsIntelligence.ts`)**:
+   - Added `TEST 12B: Shared Global Rate-Limit Privacy and Tenant Isolation` (15 assertions) verifying:
+     - Global rate-limit exhaustion is accurately detected (`global_rate_limit_exhausted`).
+     - `observed_fact` contains no exact global usage numbers, ratios, or `GLOBAL_EMAILS_PER_HOUR`.
+     - `calculated_indicator` and `recommendation` do not leak platform config or usage values.
+     - Tenant-specific campaign and sender bottleneck details (`50/50 emails`, `100/100 emails`) are preserved.
+     - In `getOperationsContext()`, no global usage, ratios, or platform config names leak into the AI context JSON.
+     - Queue summaries remain tenant-scoped with zero global count leakage.
+
+### Actual Test Results
+
+| Test Suite | Command | Result | Notes |
+|---|---|---|---|
+| Batch 7A & 7A.2 Verification Suite | `npm run batch7a:test` | ✅ PASS | 119/119 assertions passed across all 16 test scenarios |
 | Batch 6 & 6.1 Verification Suite | `npm run batch6:test` | ✅ PASS | 108/108 assertions passed across all 19 test scenarios |
 | Batch 5 Verification Suite | `npm run batch5:test` | ✅ PASS | 142/142 assertions passed across all 21 test sections |
 | Batch 4 Regression Suite | `npm run batch4:test` | ✅ PASS | 51/51 assertions passed across all 10 scenarios |

@@ -858,6 +858,109 @@ async function runBatch7AVerification(): Promise<void> {
       );
 
       // ---------------------------------------------------------------------
+      // TEST 12B: Shared Global Rate-Limit Privacy & Tenant Isolation (Batch 7A.2)
+      // ---------------------------------------------------------------------
+      console.log('\n' + SUB_SEP);
+      console.log('TEST 12B: Shared Global Rate-Limit Privacy and Tenant Isolation');
+      console.log(SUB_SEP);
+
+      // Save previous env var and set global limit
+      const prevGlobalLimit = process.env['GLOBAL_EMAILS_PER_HOUR'];
+      process.env['GLOBAL_EMAILS_PER_HOUR'] = '500';
+
+      try {
+        // Simulate global hourly limit exhaustion in Redis
+        await redis.set('rate-limit:global', '500', 'EX', 1800);
+
+        // Also simulate sender limit exhaustion for Sender A1
+        await redis.set(`rate-limit:sender:${senderA1Id}`, '100', 'EX', 1800);
+
+        const bottlenecksRes = await analyzeOperationalBottlenecks(userAId, testPool, redis, emailQueue);
+        const globalBottleneck = bottlenecksRes.bottlenecks.find(
+          (b) => b.bottleneck_type === 'global_rate_limit_exhausted'
+        );
+
+        assert(Boolean(globalBottleneck), 'Global rate-limit exhaustion is detected');
+        assert(
+          globalBottleneck?.observed_fact.includes('Shared platform') === true &&
+            globalBottleneck?.observed_fact.includes('throttled') === true,
+          'Informs tenant that shared platform throttling is active'
+        );
+        assert(
+          !globalBottleneck?.observed_fact.includes('500') &&
+            !globalBottleneck?.observed_fact.includes('500/500'),
+          'Exact global usage and usage/limit values are not exposed in observed_fact'
+        );
+        assert(
+          !globalBottleneck?.observed_fact.includes('GLOBAL_EMAILS_PER_HOUR'),
+          'Internal platform config name is not exposed in observed_fact'
+        );
+        assert(
+          !globalBottleneck?.calculated_indicator.includes('500/500') &&
+            !globalBottleneck?.calculated_indicator.includes('GLOBAL_EMAILS_PER_HOUR'),
+          'Global metrics are not exposed in calculated_indicator'
+        );
+        assert(
+          !globalBottleneck?.recommendation.includes('GLOBAL_EMAILS_PER_HOUR') &&
+            !globalBottleneck?.recommendation.includes('500'),
+          'Recommendation is tenant-safe and does not leak platform config or usage numbers'
+        );
+
+        // Verify tenant-specific campaign & sender bottleneck information is preserved
+        const campB = bottlenecksRes.bottlenecks.find(
+          (b) => b.bottleneck_type === 'campaign_hourly_limit_exhausted'
+        );
+        assert(Boolean(campB), 'Tenant campaign rate-limit bottleneck is preserved');
+        assert(
+          campB?.observed_fact.includes('50/50 emails') === true,
+          'Tenant campaign bottleneck preserves tenant own configured limit details'
+        );
+
+        const senderB = bottlenecksRes.bottlenecks.find(
+          (b) => b.bottleneck_type === 'sender_rate_limit_exhausted'
+        );
+        assert(Boolean(senderB), 'Tenant sender rate-limit bottleneck is preserved');
+        assert(
+          senderB?.observed_fact.includes('100/100 emails') === true,
+          'Tenant sender bottleneck preserves tenant own configured limit details'
+        );
+
+        // Verify getOperationsContext() for LLM context privacy
+        const globalOpsContext = await getOperationsContext(userAId, {}, testPool, redis, emailQueue);
+        const globalCtxJson = JSON.stringify(globalOpsContext);
+
+        assert(
+          !globalCtxJson.includes('500/500') && !globalCtxJson.includes('GLOBAL_EMAILS_PER_HOUR'),
+          'Global metrics and config names do not enter the tenant LLM operations context'
+        );
+        assert(
+          globalOpsContext.bottlenecks.some((b) => b.type === 'global_rate_limit_exhausted'),
+          'Global bottleneck is present in tenant operations context'
+        );
+        const ctxGlobalB = globalOpsContext.bottlenecks.find((b) => b.type === 'global_rate_limit_exhausted');
+        assert(
+          !ctxGlobalB?.fact.includes('500') && !ctxGlobalB?.indicator.includes('500/500'),
+          'Context bottleneck fact and indicator do not leak global counts'
+        );
+        assert(
+          globalOpsContext.queue_summary.count_scope === 'tenant_scoped',
+          'Queue summary scope remains strictly tenant_scoped'
+        );
+        assert(
+          (globalOpsContext.queue_summary as any).global_counts === undefined,
+          'Global queue counts remain unavailable to ordinary tenants'
+        );
+      } finally {
+        if (prevGlobalLimit !== undefined) {
+          process.env['GLOBAL_EMAILS_PER_HOUR'] = prevGlobalLimit;
+        } else {
+          delete process.env['GLOBAL_EMAILS_PER_HOUR'];
+        }
+        await redis.del('rate-limit:global');
+        await redis.del(`rate-limit:sender:${senderA1Id}`);
+      }
+
+      // ---------------------------------------------------------------------
       // TEST 13: Zero Database Mutations During Intelligence Queries (Read-Only)
       // ---------------------------------------------------------------------
       console.log('\n' + SUB_SEP);

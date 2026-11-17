@@ -799,16 +799,15 @@ export async function analyzeOperationalBottlenecks(
       ]);
       const usage = parseInt(usageStr || '0', 10);
       if (usage >= globalLimit) {
+        const waitText = ttl > 0 ? ` for ~${ttl} seconds` : '';
         bottlenecks.push({
           bottleneck_type: 'global_rate_limit_exhausted',
           severity: 'critical',
-          observed_fact: `Global system hourly limit reached (${usage}/${globalLimit} emails).`,
-          calculated_indicator: `All outbound delivery dispatches globally paused for ~${Math.max(
-            ttl,
-            0
-          )} seconds until window reset.`,
+          observed_fact:
+            'Shared platform hourly delivery capacity limit reached. Outbound dispatches are temporarily throttled.',
+          calculated_indicator: `Outbound delivery dispatches are temporarily paused${waitText} until the shared capacity window resets.`,
           recommendation:
-            'Wait for the global quota window to reset. If sustained, increase GLOBAL_EMAILS_PER_HOUR capacity.',
+            'Shared platform capacity resets hourly. Outbound dispatches will resume automatically; no tenant action required.',
           source_ids: [],
         });
       }
