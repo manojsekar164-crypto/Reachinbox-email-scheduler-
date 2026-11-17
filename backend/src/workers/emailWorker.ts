@@ -286,9 +286,18 @@ export async function processEmailJob(
     // Release delivery claim safely: resets attempt_count, transitions status to retry_wait, persists next_attempt_at
     await releaseDeliveryClaim(claimedDelivery.id, 'retry_wait', effectiveDelayMs, dbClient);
 
-    // If campaign hourly limit reached, preserve existing Slack rate-limit notification
-    if (reason === 'campaign') {
-      await handleRateLimitNotification(campaignId, campaign.hourly_limit, waitMs);
+    // Send rate-limit alert via Slack if campaign, sender, or global limit was reached
+    if (reason === 'campaign' || reason === 'sender' || reason === 'global') {
+      await handleRateLimitNotification({
+        campaignId,
+        reason,
+        waitMs,
+        campaignLimit: campaign.hourly_limit,
+        senderId: sender ? sender.id : null,
+        senderEmail: sender ? sender.email : null,
+        senderLimit: sender ? sender.hourly_limit : null,
+        globalLimit,
+      });
     }
 
     if (job.moveToDelayed) {

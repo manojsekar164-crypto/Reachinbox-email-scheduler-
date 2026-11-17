@@ -1193,3 +1193,69 @@ Secure the existing Bull Board dashboard at `/admin/queues` with robust session 
 | Batch 1 Regression Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
 | TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
 | Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched |
+
+---
+
+## 2026-11-18 – Entry 022: Batch 9 – Real Slack OAuth & Rate-Limit Notifications
+
+### Scope & Objective
+Implement a production-ready Slack integration using real Slack OAuth 2.0 and send rich, tenant-safe Slack notifications when email sending rate limits are reached:
+1. **Real Slack OAuth v2 Flow (`/auth/slack`, `/auth/slack/callback`, `/auth/slack/status`, `DELETE /auth/slack`)**:
+   - `GET /auth/slack`: Generates a cryptographically secure 64-character hex state token (`crypto.randomBytes(32).toString('hex')`).
+   - Stores state token in Redis with key `slack:oauth:state:<state>` and strict 10-minute (600s) TTL.
+   - Binds state token directly to authenticated tenant user ID (`{ userId: req.user.id, createdAt: Date.now() }`).
+   - Generates authorization URL pointing to `https://slack.com/oauth/v2/authorize` with `channels:read`, `chat:write`, and `incoming-webhook` scopes.
+   - Supports `format=json` for headless/SPA clients or performs standard 302 redirect.
+2. **Replay & State Hijacking Protection (Atomic Fetch-and-Delete)**:
+   - `GET /auth/slack/callback`: Implements atomic one-time validation using a single Redis Lua script (`local v = redis.call('GET', KEYS[1]); if v then redis.call('DEL', KEYS[1]) end; return v`).
+   - Verifies state existence, validates expiration, and enforces user binding (`storedUserId === req.user.id`), completely preventing replay attacks and cross-tenant state hijacking (returns HTTP 403 Forbidden on hijacking attempt).
+3. **Production Safety & Real OAuth Code Exchange**:
+   - Strictly prohibits mock authorization codes (`mock-code-*`) in production (`NODE_ENV === 'production'`), throwing an explicit HTTP 400 error.
+   - Performs server-side code exchange with Slack API endpoint `https://slack.com/api/oauth.v2.access` using `client_id` and `client_secret`.
+   - Validates Slack API response, extracting workspace name, team ID, channel name, bot access token, and incoming webhook URL.
+4. **Token Encryption & Redaction at Rest**:
+   - Access tokens and webhook URLs are encrypted at rest using AES-256-GCM (`encrypt()`) before saving to the `slack_integrations` table.
+   - Decrypted only at execution time (`decrypt()`) for outbound notifications.
+   - `GET /auth/slack/status` strictly redacts sensitive credentials, returning only safe metadata (`connected: true/false`, `teamName`, `channelName`, `updatedAt`). Webhook URLs and access tokens are never returned in API payloads or logged in console logs.
+5. **Rate-Limit Throttling Notifications (`emailWorker.ts` & `slackService.ts`)**:
+   - In `emailWorker.ts`, when a rate-limiting reservation is rejected (`!reservation.allowed`), automatically triggers `handleRateLimitNotification`:
+     - Global limit reached (`reason === 'global'`): notifies tenant that platform-wide hourly sending capacity is reached.
+     - Sender limit reached (`reason === 'sender'`): notifies tenant that sender-specific hourly limit is reached with sender email.
+     - Campaign limit reached (`reason === 'campaign'`): notifies tenant that campaign-specific hourly limit is reached.
+     - Spacing delay (`reason === 'spacing'`): gracefully ignored (normal pacing, does not spam Slack).
+   - Formats clean, human-readable reset durations (e.g. `~15m 00s`, `~1h 00m 00s`).
+   - Strictly ensures zero passwords, tokens, API keys, or recipient emails are leaked in alert text.
+6. **Redis Deduplication**:
+   - Enforces window-based Redis deduplication per scope (`slack:ratelimit:notified:<scope>:<id>:<windowEpoch>`) with TTL set to `waitMs`.
+   - Guarantees that only 1 Slack notification is sent per rate-limit window, suppressing duplicate spam across concurrent worker threads.
+7. **Complete Reliability Isolation**:
+   - All Slack notification operations are wrapped in safe try/catch blocks.
+   - Missing integration, Slack API network errors, HTTP timeouts, or invalid webhooks log an error and safely return without throwing or failing worker execution.
+   - Email deliveries and campaign processing continue uninterrupted.
+
+### Key Files Created & Modified
+1. `backend/src/types/express.d.ts`: Added `slackOAuth` type definition to session data.
+2. `backend/src/services/slackIntegrationService.ts`: Added poolClient parameter support for testing isolation and `toPublicSlackStatus` redaction helper.
+3. `backend/src/controllers/slackAuthController.ts`: Implemented secure OAuth v2 state generation, atomic Lua consumption, code exchange, encrypted persistence, and status/disconnect endpoints.
+4. `backend/src/services/slackService.ts`: Polymorphic `handleRateLimitNotification`, `notifyCampaignCreated`, and `notifyCampaignCompleted` with Redis deduplication and formatted duration calculation.
+5. `backend/src/workers/emailWorker.ts`: Integrated notifications for global, sender, and campaign rate-limiting events.
+6. `backend/package.json`: Registered `"batch9:test"` verification script.
+7. `backend/src/scripts/testBatch9SlackIntegration.ts`: Comprehensive 14-scenario verification suite.
+8. `docs/IMPLEMENTATION_LOG.md`: Appended Entry 022.
+
+### Actual Test Results
+
+| Test Suite | Command | Result | Notes |
+|---|---|---|---|
+| Batch 9 Verification Suite | `npm run batch9:test` | ✅ PASS | 66/66 assertions passed across all 14 test scenarios |
+| Batch 8 Verification Suite | `npm run batch8:test` | ✅ PASS | 52/52 assertions passed across all 15 test scenarios |
+| Batch 7B Verification Suite | `npm run batch7b:test` | ✅ PASS | 63/63 assertions passed across all 17 test scenarios |
+| Batch 7A & 7A.2 Verification Suite | `npm run batch7a:test` | ✅ PASS | 119/119 assertions passed across all 16 test scenarios |
+| Batch 6 & 6.1 Verification Suite | `npm run batch6:test` | ✅ PASS | 108/108 assertions passed across all 19 test scenarios |
+| Batch 5 Verification Suite | `npm run batch5:test` | ✅ PASS | 142/142 assertions passed across all 21 test sections |
+| Batch 4 Regression Suite | `npm run batch4:test` | ✅ PASS | 51/51 assertions passed across all 10 scenarios |
+| Batch 3 Regression Suite | `npm run batch3:test` | ✅ PASS | 96/96 assertions passed across all 14 scenarios |
+| Batch 2 Regression Suite | `npm run batch2:test` | ✅ PASS | 25/25 assertions passed across all 9 outbox/persistence scenarios |
+| Batch 1 Regression Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
+| TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
+| Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched |

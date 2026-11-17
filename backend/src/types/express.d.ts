@@ -18,6 +18,11 @@ declare global {
 declare module 'express-session' {
   interface SessionData {
     slackState?: string;
+    slackOAuth?: {
+      state: string;
+      userId: string;
+      expiresAt: number;
+    };
   }
 }
 

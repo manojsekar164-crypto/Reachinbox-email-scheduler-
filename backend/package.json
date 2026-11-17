@@ -21,6 +21,7 @@
     "batch7a:test": "ts-node --transpile-only src/scripts/testBatch7AOperationsIntelligence.ts",
     "batch7b:test": "ts-node --transpile-only src/scripts/testBatch7BCopilot.ts",
     "batch8:test": "ts-node --transpile-only src/scripts/testBatch8BullBoardSecurity.ts",
+    "batch9:test": "ts-node --transpile-only src/scripts/testBatch9SlackIntegration.ts",
     "credentials:migrate": "ts-node --transpile-only src/scripts/migrateCredentials.ts",
     "worker": "ts-node-dev --respawn --transpile-only src/workers/emailWorker.ts",
     "queue:test": "ts-node --transpile-only src/scripts/testQueue.ts",

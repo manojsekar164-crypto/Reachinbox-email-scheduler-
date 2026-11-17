@@ -1,11 +1,24 @@
-import { redis } from '../db/redis';
-import { db as pool } from '../db/postgres';
+import { Pool, PoolClient } from 'pg';
+import Redis from 'ioredis';
+import { redis as defaultRedis } from '../db/redis';
+import { db as defaultPool } from '../db/postgres';
 import { CampaignRow } from '../types/db.types';
 import { getSlackIntegrationByUserId } from './slackIntegrationService';
 
+export interface RateLimitNotificationOptions {
+  campaignId: string;
+  reason: 'global' | 'sender' | 'campaign' | 'spacing';
+  waitMs: number;
+  campaignLimit?: number;
+  senderId?: string | null;
+  senderEmail?: string | null;
+  senderLimit?: number | null;
+  globalLimit?: number;
+}
+
 // For testing purposes to verify notifications without requiring a live Slack channel
 export const testState = {
-  sentNotifications: [] as { text: string; timestamp: number }[],
+  sentNotifications: [] as { text: string; timestamp: number; webhookUrl?: string | null }[],
   mockSendFailure: false,
 };
 
@@ -28,20 +41,26 @@ export async function sendSlackNotification(
   const webhookUrl = customWebhookUrl || process.env.SLACK_WEBHOOK_URL;
 
   // Track notifications for integration testing assertions
-  testState.sentNotifications.push({ text, timestamp: Date.now() });
+  testState.sentNotifications.push({ text, timestamp: Date.now(), webhookUrl });
 
-  if (testState.mockSendFailure) {
+  if (testState.mockSendFailure && process.env.NODE_ENV !== 'production') {
     throw new Error('Mocked Slack HTTP post failure');
   }
 
   if (!webhookUrl || webhookUrl.trim() === '') {
-    // Return early if not configured, allowing local testing without a real Slack webhook
     console.warn('⚠️  [Slack] Slack webhook URL is not set. Skipping HTTP delivery.');
     return;
   }
 
-  if (!webhookUrl.startsWith('https://hooks.slack.com/services/')) {
+  // Allow test webhook URLs in non-production environments
+  const isMockUrl = webhookUrl.includes('mock-webhook') || webhookUrl.includes('test');
+  if (!webhookUrl.startsWith('https://hooks.slack.com/services/') && (!isMockUrl || process.env.NODE_ENV === 'production')) {
     throw new Error('Invalid Slack Webhook URL configuration: must start with "https://hooks.slack.com/services/"');
+  }
+
+  // If in test mode with mock URL, simulate successful delivery without sending actual internet requests
+  if (isMockUrl && process.env.NODE_ENV !== 'production') {
+    return;
   }
 
   const controller = new AbortController();
@@ -72,21 +91,41 @@ export async function sendSlackNotification(
 }
 
 /**
- * Handles the logic when a campaign hits its rate limit.
- * Implements deduplication using Redis and safely isolates the Slack trigger.
+ * Handles rate-limit notifications for global, sender, and campaign constraints.
+ * Implements deduplication using Redis and safely isolates the Slack trigger so
+ * email deliveries are never blocked or retried on Slack failure.
  *
- * Redis Key: slack:ratelimit:notified:<campaignId>:<windowEpoch>
- * TTL: waitMs (remaining window duration in ms)
+ * Fully backward-compatible with legacy handleRateLimitNotification(campaignId, hourlyLimit, waitMs).
  */
 export async function handleRateLimitNotification(
-  campaignId: string,
-  hourlyLimit: number,
-  waitMs: number,
+  campaignIdOrOptions: string | RateLimitNotificationOptions,
+  legacyHourlyLimit?: number,
+  legacyWaitMs?: number,
+  injectedPool: Pool | PoolClient = defaultPool,
+  injectedRedis: Redis = defaultRedis,
 ): Promise<void> {
   try {
-    // 1. Fetch campaign details to get user_id and Subject
-    const campaignResult = await pool.query<CampaignRow>(
-      'SELECT subject, user_id FROM campaigns WHERE id = $1',
+    // Normalize options
+    const options: RateLimitNotificationOptions =
+      typeof campaignIdOrOptions === 'string'
+        ? {
+            campaignId: campaignIdOrOptions,
+            reason: 'campaign',
+            waitMs: legacyWaitMs ?? 3600000,
+            campaignLimit: legacyHourlyLimit,
+          }
+        : campaignIdOrOptions;
+
+    const { campaignId, reason, waitMs, campaignLimit, senderId, senderEmail, senderLimit } = options;
+
+    // Minimum send spacing is normal sub-second pacing; do not trigger Slack alert
+    if (reason === 'spacing') {
+      return;
+    }
+
+    // 1. Fetch campaign details to resolve tenant user_id and subject
+    const campaignResult = await injectedPool.query<CampaignRow>(
+      'SELECT id, subject, user_id, hourly_limit FROM campaigns WHERE id = $1',
       [campaignId],
     );
     const campaign = campaignResult.rows[0];
@@ -97,10 +136,9 @@ export async function handleRateLimitNotification(
 
     const userId = campaign.user_id;
 
-    // 2. Resolve that user's Slack integration
-    const integration = await getSlackIntegrationByUserId(userId);
+    // 2. Resolve tenant's Slack integration
+    const integration = await getSlackIntegrationByUserId(userId, injectedPool);
     if (!integration) {
-      // If not connected, skip notification safely
       console.log(`ℹ️  [Slack] User ${userId} has no active Slack integration. Skipping notification.`);
       return;
     }
@@ -110,39 +148,73 @@ export async function handleRateLimitNotification(
       return;
     }
 
-    // 3. Calculate the end of the current rate-limit window (deterministic epoch in seconds)
+    // 3. Deduplication via Redis
     const windowEpoch = Math.floor((Date.now() + waitMs) / 1000);
-    const redisKey = `slack:ratelimit:notified:${campaignId}:${windowEpoch}`;
+    let dedupKey: string;
 
-    // Set the key with a millisecond TTL (PX) and write only if not exists (NX)
-    const ttlMs = Math.max(waitMs, 1000); // Enforce a minimum of 1s to prevent permanent keys
-    const result = await redis.set(redisKey, '1', 'PX', ttlMs, 'NX');
+    if (reason === 'global') {
+      // Deduplicate per tenant per global window
+      dedupKey = `slack:ratelimit:notified:global:${userId}:${windowEpoch}`;
+    } else if (reason === 'sender') {
+      // Deduplicate per sender per window
+      dedupKey = `slack:ratelimit:notified:sender:${senderId || 'default'}:${windowEpoch}`;
+    } else {
+      // Deduplicate per campaign per window
+      dedupKey = `slack:ratelimit:notified:campaign:${campaignId}:${windowEpoch}`;
+    }
 
-    if (result !== 'OK') {
-      // Notification already triggered during the current rate-limiting window
+    const ttlMs = Math.max(waitMs, 1000);
+    const acquired = await injectedRedis.set(dedupKey, '1', 'PX', ttlMs, 'NX');
+
+    if (acquired !== 'OK') {
+      // Already notified within the active window
       return;
     }
 
-    console.log(`📢 [Slack] Sending rate-limit notification for campaign ${campaignId} to user's Slack workspace...`);
+    console.log(`📢 [Slack] Sending ${reason} rate-limit notification for campaign ${campaignId}...`);
 
-    const campaignSubject = campaign.subject || 'Unknown Campaign';
-
-    // 4. Format the Slack alert message
     const formattedReset = formatDuration(waitMs);
-    const message = `🚦 *ReachInbox Rate Limit Alert*
+    const campaignSubject = campaign.subject || 'Unknown Campaign';
+    let message = '';
 
-*Campaign:* ${campaignSubject}
-*Campaign ID:* ${campaignId}
-*Limit:* ${hourlyLimit} emails/hour
-*Status:* Limit reached
-*Action:* Remaining jobs delayed
-*Reset in:* ${formattedReset}`;
+    // 4. Format rich Slack message based on rate-limit constraint
+    if (reason === 'global') {
+      message = `🚦 *ReachInbox Rate Limit Alert — Global Limit Reached*
 
-    // 5. Send Slack notification via user's private webhook URL
+*Event:* Global Hourly Delivery Limit Reached
+*Campaign:* ${campaignSubject} (ID: ${campaignId})
+*Reason:* Shared platform hourly email capacity limit reached. Outbound dispatches are temporarily paused.
+*Expected Resume:* In ~${formattedReset}
+*Action:* Dispatches will resume automatically once the shared capacity window resets.`;
+    } else if (reason === 'sender') {
+      const senderDisplay = senderEmail ? `${senderEmail} (${senderId || 'ID: unknown'})` : (senderId || 'Configured Sender');
+      const limitDisplay = senderLimit !== undefined && senderLimit !== null ? `${senderLimit} emails/hour` : 'Configured Limit';
+      message = `🚦 *ReachInbox Rate Limit Alert — Sender Limit Reached*
+
+*Event:* Sender Hourly Delivery Limit Reached
+*Sender:* ${senderDisplay}
+*Campaign:* ${campaignSubject} (ID: ${campaignId})
+*Limit:* ${limitDisplay}
+*Reason:* Sender hourly sending limit exhausted.
+*Expected Resume:* In ~${formattedReset}
+*Action:* Dispatches from this sender are paused until the quota window resets.`;
+    } else {
+      const limitDisplay = (campaignLimit || campaign.hourly_limit) ? `${campaignLimit || campaign.hourly_limit} emails/hour` : 'Configured Limit';
+      message = `🚦 *ReachInbox Rate Limit Alert — Campaign Limit Reached*
+
+*Event:* Campaign Hourly Delivery Limit Reached
+*Campaign:* ${campaignSubject} (ID: ${campaignId})
+*Limit:* ${limitDisplay}
+*Reason:* Campaign hourly sending limit exhausted.
+*Expected Resume:* In ~${formattedReset}
+*Action:* Remaining deliveries delayed until the next hourly window.`;
+    }
+
+    // 5. Send Slack notification via user's encrypted webhook URL
     await sendSlackNotification(message, integration.webhook_url);
-    console.log(`✅ [Slack] Notification sent successfully for campaign ${campaignId}`);
+    console.log(`✅ [Slack] Notification sent successfully for campaign ${campaignId} (reason: ${reason})`);
   } catch (error: any) {
-    // 6. Isolate error safely to never interrupt the core worker flow
+    // 6. Safe error boundary: never fail worker processing or trigger email retries
     console.error(`❌ [Slack] Notification failed: ${error.message}`);
   }
 }
@@ -157,11 +229,10 @@ function formatDuration(ms: number): string {
   const secs = totalSecs % 60;
 
   const pad = (n: number) => String(n).padStart(2, '0');
-
   if (hrs > 0) {
-    return `${pad(hrs)}:${pad(mins)}:${pad(secs)}`;
+    return `${pad(hrs)}h ${pad(mins)}m ${pad(secs)}s`;
   }
-  return `${pad(mins)}:${pad(secs)}`;
+  return `${pad(mins)}m ${pad(secs)}s`;
 }
 
 /**
@@ -171,18 +242,23 @@ export async function notifyCampaignCreated(
   userId: string,
   subject: string,
   recipientCount: number,
-  hourlyLimit: number,
+  scheduledAtOrLimit?: Date | number | null,
 ): Promise<void> {
   try {
     const integration = await getSlackIntegrationByUserId(userId);
     if (!integration || !integration.webhook_url) return;
 
-    const message = `🚀 *ReachInbox Campaign Launched*
+    let scheduleTime = 'Immediately';
+    if (scheduledAtOrLimit instanceof Date) {
+      scheduleTime = scheduledAtOrLimit.toLocaleString();
+    } else if (typeof scheduledAtOrLimit === 'number') {
+      scheduleTime = `Hourly Limit: ${scheduledAtOrLimit}/hr`;
+    }
 
-*Campaign:* ${subject}
-*Recipients:* ${recipientCount} leads
-*Rate Limit:* ${hourlyLimit} emails/hour
-*Status:* Enqueued & processing in queue`;
+    const message = `🚀 *New Campaign Created!*
+*Subject:* ${subject}
+*Recipients:* ${recipientCount}
+*Scheduled For:* ${scheduleTime}`;
 
     await sendSlackNotification(message, integration.webhook_url);
     console.log(`✅ [Slack] Campaign created notification sent for: ${subject}`);
@@ -196,18 +272,26 @@ export async function notifyCampaignCreated(
  */
 export async function notifyCampaignCompleted(
   userId: string,
-  campaignId: string,
-  subject: string,
+  subjectOrCampaignId: string,
+  totalSentOrSubject?: number | string,
 ): Promise<void> {
   try {
     const integration = await getSlackIntegrationByUserId(userId);
     if (!integration || !integration.webhook_url) return;
 
-    const message = `🎉 *ReachInbox Campaign Completed*
+    let subject = subjectOrCampaignId;
+    let detail = '';
 
-*Campaign:* ${subject}
-*Campaign ID:* ${campaignId}
-*Status:* All recipients delivered successfully!`;
+    if (typeof totalSentOrSubject === 'string') {
+      subject = totalSentOrSubject;
+      detail = `*Campaign ID:* ${subjectOrCampaignId}`;
+    } else if (typeof totalSentOrSubject === 'number') {
+      detail = `*Total Sent:* ${totalSentOrSubject} emails`;
+    }
+
+    const message = `🎉 *Campaign Completed!*
+*Subject:* ${subject}
+${detail}`.trim();
 
     await sendSlackNotification(message, integration.webhook_url);
     console.log(`✅ [Slack] Campaign completed notification sent for: ${subject}`);
@@ -215,4 +299,3 @@ export async function notifyCampaignCompleted(
     console.warn(`⚠️ [Slack] Campaign completed notification failed: ${err.message}`);
   }
 }
-

@@ -1,38 +1,78 @@
 import { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import { config } from '../config';
+import { redis } from '../db/redis';
 import {
   saveSlackIntegration,
   getSlackIntegrationByUserId,
   deleteSlackIntegrationByUserId,
+  toPublicSlackStatus,
 } from '../services/slackIntegrationService';
 import { UserRow } from '../types/db.types';
+
+const OAUTH_STATE_TTL_SECONDS = 600; // 10 minutes
 
 /**
  * GET /auth/slack
  * Starts the Slack OAuth v2 flow.
- * Generates and stores a secure random state in the session for CSRF protection.
+ * Generates a cryptographically secure, one-time OAuth state, stores it in Redis
+ * with TTL and binds it to the authenticated user ID.
  */
-export function connectSlack(req: Request, res: Response): void {
+export async function connectSlack(req: Request, res: Response): Promise<void> {
   const clientId = config.slack.clientId;
   const clientSecret = config.slack.clientSecret;
   const redirectUri = config.slack.redirectUri;
 
-  // Validate configuration presence without exposing the secret
   if (!clientId || !clientSecret || !redirectUri) {
-    res.status(500).json({
+    res.status(503).json({
       error: 'Slack integration is not configured on this server. Please contact administrator.',
     });
     return;
   }
 
-  // Generate cryptographically secure state
-  const state = crypto.randomBytes(16).toString('hex');
+  if (!req.user || !(req.user as UserRow).id) {
+    res.status(401).json({ error: 'Authentication required' });
+    return;
+  }
+
+  const userId = (req.user as UserRow).id;
+
+  // Generate 64-character cryptographically secure state
+  const state = crypto.randomBytes(32).toString('hex');
+  const stateKey = `slack:oauth:state:${state}`;
+
+  // Store state in Redis with 10-minute expiration and user binding
+  try {
+    await redis.set(
+      stateKey,
+      JSON.stringify({ userId, createdAt: Date.now() }),
+      'EX',
+      OAUTH_STATE_TTL_SECONDS,
+    );
+  } catch (err) {
+    console.warn('⚠️  [SlackOAuth] Failed to persist state in Redis:', (err as Error).message);
+  }
+
+  // Backup in session as secondary store
+  req.session.slackOAuth = {
+    state,
+    userId,
+    expiresAt: Date.now() + OAUTH_STATE_TTL_SECONDS * 1000,
+  };
   req.session.slackState = state;
 
-  // Construct authorization URL
-  // We request 'incoming-webhook' scope which allows the installer to select a channel
-  const slackAuthUrl = `https://slack.com/oauth/v2/authorize?client_id=${clientId}&scope=incoming-webhook&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}`;
+  // Minimum required scope: incoming-webhook
+  const slackAuthUrl = `https://slack.com/oauth/v2/authorize?client_id=${clientId}&scope=incoming-webhook&redirect_uri=${encodeURIComponent(
+    redirectUri,
+  )}&state=${state}`;
+
+  if (
+    req.headers.accept?.includes('application/json') ||
+    req.query.format === 'json'
+  ) {
+    res.status(200).json({ url: slackAuthUrl, state });
+    return;
+  }
 
   res.redirect(slackAuthUrl);
 }
@@ -40,7 +80,8 @@ export function connectSlack(req: Request, res: Response): void {
 /**
  * GET /auth/slack/callback
  * Handles the redirect back from Slack after authorization.
- * Exposes support for mock exchange codes in testing environments.
+ * Validates one-time state, user binding, exchanges code server-side,
+ * and persists encrypted credentials.
  */
 export async function slackCallback(
   req: Request,
@@ -51,38 +92,94 @@ export async function slackCallback(
     const { code, state } = req.query;
 
     // 1. Verify user is authenticated
-    // Note: requireAuth middleware already protects this route. This check
-    // uses req.user directly (works with both Passport sessions and the
-    // test-auth backdoor set by requireAuth).
-    if (!req.user) {
+    if (!req.user || !(req.user as UserRow).id) {
       res.status(401).json({ error: 'Authentication required' });
       return;
     }
     const user = req.user as UserRow;
 
-    // 2. Validate state (CSRF protection)
-    const storedState = req.session.slackState;
-    if (!state || !storedState || state !== storedState) {
-      res.status(400).json({ error: 'CSRF validation failed: State mismatch or missing state.' });
+    // 2. Validate state existence
+    if (!state || typeof state !== 'string') {
+      res.status(400).json({
+        error: 'CSRF validation failed: State is missing or invalid.',
+      });
       return;
     }
 
-    // Invalidate state immediately
-    delete req.session.slackState;
+    // 3. One-time atomic state validation and consumption from Redis
+    const stateKey = `slack:oauth:state:${state}`;
+    let storedUserId: string | null = null;
 
-    // 3. Validate code presence
+    try {
+      // Atomic GET and DEL prevents replay attacks
+      const redisStateStr = (await redis.eval(
+        "local v = redis.call('GET', KEYS[1]); if v then redis.call('DEL', KEYS[1]) end; return v",
+        1,
+        stateKey,
+      )) as string | null;
+
+      if (redisStateStr) {
+        const parsed = JSON.parse(redisStateStr);
+        storedUserId = parsed.userId;
+      }
+    } catch (err) {
+      console.warn(
+        '⚠️  [SlackOAuth] Redis state evaluation error, checking session fallback:',
+        (err as Error).message,
+      );
+    }
+
+    // Check session fallback if Redis didn't hold it
+    if (!storedUserId && req.session.slackOAuth && req.session.slackOAuth.state === state) {
+      if (Date.now() < req.session.slackOAuth.expiresAt) {
+        storedUserId = req.session.slackOAuth.userId;
+      }
+      delete req.session.slackOAuth;
+      delete req.session.slackState;
+    } else if (!storedUserId && req.session.slackState && req.session.slackState === state) {
+      storedUserId = user.id;
+      delete req.session.slackState;
+    }
+
+    // Reject invalid, expired, or replayed state
+    if (!storedUserId) {
+      res.status(400).json({
+        error: 'CSRF validation failed: State is invalid, expired, or already used.',
+      });
+      return;
+    }
+
+    // Reject user mismatch (state generated by User A cannot be claimed by User B)
+    if (storedUserId !== user.id) {
+      res.status(403).json({
+        error: 'CSRF validation failed: State does not belong to the authenticated user.',
+      });
+      return;
+    }
+
+    // 4. Validate code presence
     if (!code || typeof code !== 'string') {
       res.status(400).json({ error: 'Authorization code is missing.' });
       return;
     }
 
-    // 4. Exchange authorization code with Slack OAuth API
+    // 5. Code exchange with Slack API
     let oauthResponse: any;
 
     if (code.startsWith('mock-code-')) {
-      // Mock code exchange for testing to avoid hitting real Slack servers
+      // Strictly forbid mock codes in production
+      if (process.env.NODE_ENV === 'production') {
+        res.status(400).json({
+          error: 'Mock OAuth codes are not permitted in production environment.',
+        });
+        return;
+      }
+
+      // Safe test/dev mock responses
       if (code === 'mock-code-fail') {
         oauthResponse = { ok: false, error: 'invalid_code' };
+      } else if (code === 'mock-code-revoked') {
+        oauthResponse = { ok: false, error: 'token_revoked' };
       } else {
         oauthResponse = {
           ok: true,
@@ -102,30 +199,61 @@ export async function slackCallback(
         };
       }
     } else {
-      // Real code exchange
-      const params = new URLSearchParams();
-      params.append('client_id', config.slack.clientId!);
-      params.append('client_secret', config.slack.clientSecret!);
-      params.append('code', code);
-      params.append('redirect_uri', config.slack.redirectUri!);
+      // Real OAuth code exchange
+      const clientId = config.slack.clientId;
+      const clientSecret = config.slack.clientSecret;
+      const redirectUri = config.slack.redirectUri;
 
-      const response = await fetch('https://slack.com/api/oauth.v2.access', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: params.toString(),
-      });
-
-      if (!response.ok) {
-        res.status(400).json({ error: `Slack API responded with HTTP status ${response.status}` });
+      if (!clientId || !clientSecret || !redirectUri) {
+        res.status(503).json({
+          error: 'Slack client credentials are not configured.',
+        });
         return;
       }
 
-      oauthResponse = await response.json();
+      const params = new URLSearchParams();
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      params.append('code', code);
+      params.append('redirect_uri', redirectUri);
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+      try {
+        const response = await fetch('https://slack.com/api/oauth.v2.access', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          body: params.toString(),
+          signal: controller.signal,
+        });
+
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+          res.status(400).json({
+            error: `Slack API responded with HTTP status ${response.status}`,
+          });
+          return;
+        }
+
+        oauthResponse = await response.json();
+      } catch (fetchErr: any) {
+        clearTimeout(timeoutId);
+        if (fetchErr.name === 'AbortError') {
+          res.status(504).json({ error: 'Slack OAuth exchange timed out.' });
+          return;
+        }
+        res.status(502).json({
+          error: `Failed to communicate with Slack API: ${fetchErr.message}`,
+        });
+        return;
+      }
     }
 
-    // 5. Validate OAuth Response
+    // 6. Validate OAuth response payload
     if (!oauthResponse.ok) {
       res.status(400).json({
         error: `Slack OAuth exchange failed: ${oauthResponse.error || 'unknown error'}`,
@@ -133,7 +261,21 @@ export async function slackCallback(
       return;
     }
 
-    // 6. Save connection for current session user (req.user.id)
+    if (!oauthResponse.team?.id || !oauthResponse.team?.name) {
+      res.status(400).json({
+        error: 'Slack OAuth response missing workspace team identity.',
+      });
+      return;
+    }
+
+    if (!oauthResponse.access_token) {
+      res.status(400).json({
+        error: 'Slack OAuth response missing bot access token.',
+      });
+      return;
+    }
+
+    // 7. Save connection with tokens encrypted at rest
     await saveSlackIntegration({
       userId: user.id,
       teamId: oauthResponse.team.id,
@@ -142,11 +284,25 @@ export async function slackCallback(
       channelId: oauthResponse.incoming_webhook?.channel_id || null,
       channelName: oauthResponse.incoming_webhook?.channel || null,
       webhookUrl: oauthResponse.incoming_webhook?.url || null,
-      scope: oauthResponse.scope,
+      scope: oauthResponse.scope || 'incoming-webhook',
     });
 
-    // Redirect to frontend or status endpoint
-    const frontendUrl = process.env['FRONTEND_URL'] ? `${process.env['FRONTEND_URL']}?slack=connected` : (req.query['state'] && req.query['code']?.toString().startsWith('mock-code-') ? '/auth/slack/status' : 'http://localhost:5173/dashboard?slack=connected');
+    // 8. Return response
+    if (
+      req.headers.accept?.includes('application/json') ||
+      req.query.format === 'json'
+    ) {
+      res.status(200).json({
+        success: true,
+        teamName: oauthResponse.team.name,
+        channelName: oauthResponse.incoming_webhook?.channel || null,
+      });
+      return;
+    }
+
+    const frontendUrl = process.env['FRONTEND_URL']
+      ? `${process.env['FRONTEND_URL']}?slack=connected`
+      : '/auth/slack/status';
     res.redirect(frontendUrl);
   } catch (err) {
     next(err);
@@ -156,6 +312,7 @@ export async function slackCallback(
 /**
  * GET /auth/slack/status
  * Returns connection status and safe workspace/channel info for the logged-in user.
+ * Access tokens and webhook secret URLs are strictly redacted.
  */
 export async function getSlackStatus(
   req: Request,
@@ -163,26 +320,16 @@ export async function getSlackStatus(
   next: NextFunction,
 ): Promise<void> {
   try {
-    // requireAuth already gates this route; trust req.user directly.
-    if (!req.user) {
+    if (!req.user || !(req.user as UserRow).id) {
       res.status(401).json({ error: 'Authentication required' });
       return;
     }
     const user = req.user as UserRow;
 
     const integration = await getSlackIntegrationByUserId(user.id);
+    const publicStatus = toPublicSlackStatus(integration);
 
-    if (!integration) {
-      res.status(200).json({ connected: false });
-      return;
-    }
-
-    // Never return access_token, webhook_url, or other secrets
-    res.status(200).json({
-      connected: true,
-      teamName: integration.team_name,
-      channelName: integration.channel_name,
-    });
+    res.status(200).json(publicStatus);
   } catch (err) {
     next(err);
   }
@@ -198,8 +345,7 @@ export async function disconnectSlack(
   next: NextFunction,
 ): Promise<void> {
   try {
-    // requireAuth already gates this route; trust req.user directly.
-    if (!req.user) {
+    if (!req.user || !(req.user as UserRow).id) {
       res.status(401).json({ error: 'Authentication required' });
       return;
     }
