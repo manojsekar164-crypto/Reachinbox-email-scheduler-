@@ -863,3 +863,60 @@ Awaiting explicit operator authorization.
 | Batch 1 Regression Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
 | TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
 | Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched |
+
+---
+
+## 2026-11-17 – Entry 016: Batch 6.1 – Atomic Campaign Pause and Cancellation
+
+### Scope & Objective
+Fix two campaign-control defects in campaign lifecycle management:
+1. **Bug 1: Atomic Campaign Cancellation (`cancelCampaign`)**:
+   - Wrap campaign cancellation in an explicit PostgreSQL transaction (`BEGIN ... COMMIT / ROLLBACK`) using a dedicated client.
+   - Lock the campaign row for update (`FOR UPDATE`) and verify user ownership before modifying any state.
+   - Atomically update campaign status to `cancelled`, cancel eligible delivery records (`pending`, `scheduled`, `retry_wait`), and cancel pending/processing outbox events (`delivery_outbox`) in the same transaction.
+   - Ensure complete rollback if any operation fails (`injectFailure` testing hook supported).
+   - Strictly preserve `sent` and `unknown` deliveries without modification.
+   - Preserve active SMTP operations (`status = 'sending' AND lease_expires_at > NOW()`) and accurately report their count in `in_flight_count`.
+   - Ensure repeated cancellation requests are idempotent.
+2. **Bug 2: Synchronize Pause/Cancel with Worker Claims (`pauseCampaign`, `cancelCampaign`, `claimDelivery`)**:
+   - Establish a consistent PostgreSQL row-locking hierarchy: Parent (`campaigns`) first, Child (`email_deliveries`) second.
+   - Update `claimDelivery` in `deliveryService.ts` to acquire `FOR SHARE OF c` on `campaigns` and `FOR UPDATE OF ed SKIP LOCKED` on `email_deliveries`.
+   - Update `pauseCampaign` to use an explicit transaction and acquire `FOR UPDATE` on `campaigns`.
+   - When `pauseCampaign` or `cancelCampaign` acquires `FOR UPDATE`, racing claims either complete before the transition (and are reported in `in_flight_count`), or are rejected after the transition (`claimDelivery` returns `null` because `c.status = 'sending'` is false).
+   - Eliminate deadlocks, race conditions, and never hold database transactions open across external network operations.
+
+### Key Changes
+1. `backend/src/types/recovery.types.ts`:
+   - Added `CancelCampaignOptions { injectFailure?: boolean; }`.
+2. `backend/src/services/deliveryService.ts`:
+   - Updated `claimDelivery()` query to join `campaigns c` and lock `FOR SHARE OF c`, `FOR UPDATE OF ed SKIP LOCKED`.
+   - Guaranteed consistent locking order (`campaigns` -> `email_deliveries`).
+3. `backend/src/services/recoveryService.ts`:
+   - Refactored `pauseCampaign()` and `cancelCampaign()` to manage dedicated clients from `Pool` or reuse existing `PoolClient` without reconnection conflicts.
+   - Implemented explicit transactions (`BEGIN ... COMMIT / ROLLBACK`).
+   - Added `SELECT ... FROM campaigns WHERE id = $1 AND user_id = $2 FOR UPDATE`.
+   - Counted active dispatches (`status = 'sending' AND lease_expires_at > NOW()`) as `in_flight_count`.
+   - Updated campaign status, eligible delivery statuses (`status IN ('pending', 'scheduled', 'retry_wait')`), and pending outbox events within the single atomic transaction.
+   - Supported rollback verification through `options?.injectFailure`.
+4. `backend/src/scripts/testBatch6Recovery.ts`:
+   - Added Tests 13–19 verifying:
+     - Test 13: Atomic campaign cancellation commits all tables (`campaigns`, `email_deliveries`, `delivery_outbox`).
+     - Test 14: Injected cancellation failure rolls back all tables completely.
+     - Test 15: Concurrent cancellation requests remain idempotent.
+     - Test 16: Pause racing with delivery claiming safely synchronized.
+     - Test 17: Cancellation racing with delivery claiming safely synchronized.
+     - Test 18: In-flight dispatches counted and active dispatches preserved.
+     - Test 19: Strict preservation of sent and unknown deliveries across cancellation.
+
+### Actual Test Results
+
+| Test Suite | Command | Result | Notes |
+|---|---|---|---|
+| Batch 6 & 6.1 Verification Suite | `npm run batch6:test` | ✅ PASS | 108/108 assertions passed across all 19 test scenarios |
+| Batch 5 Verification Suite | `npm run batch5:test` | ✅ PASS | 142/142 assertions passed across all 21 test sections |
+| Batch 4 Regression Suite | `npm run batch4:test` | ✅ PASS | 51/51 assertions passed across all 10 scenarios |
+| Batch 3 Regression Suite | `npm run batch3:test` | ✅ PASS | 96/96 assertions passed across all 14 scenarios |
+| Batch 2 Regression Suite | `npm run batch2:test` | ✅ PASS | 25/25 assertions passed across all 9 outbox/persistence scenarios |
+| Batch 1 Regression Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
+| TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
+| Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched |

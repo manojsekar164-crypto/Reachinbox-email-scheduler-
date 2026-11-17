@@ -7,7 +7,7 @@
  *  - Runs strictly against an isolated ephemeral database: `reachinbox_migration_test`.
  *  - Restores verified production backup: `reachinbox-pre-stage1.dump`.
  *  - Executes schema migrations (001–008) in the isolated database.
- *  - Tests all 12 mandatory acceptance criteria:
+ *  - Tests all mandatory acceptance criteria (Batch 6 & Batch 6.1):
  *      1. User cannot access another user's failures (cross-tenant isolation).
  *      2. Failure listing and pagination.
  *      3. Attempt history preservation.
@@ -20,6 +20,13 @@
  *     10. Pause prevents new claims.
  *     11. Resume republishes eligible deliveries safely.
  *     12. Cancel prevents remaining dispatches.
+ *     13. Atomic campaign cancellation commits all tables.
+ *     14. Injected cancellation failure rolls back all tables completely.
+ *     15. Concurrent cancellation requests remain idempotent.
+ *     16. Pause racing with delivery claiming (row-locking synchronization).
+ *     17. Cancellation racing with delivery claiming (row-locking synchronization).
+ *     18. In-flight dispatches counted and active dispatches preserved.
+ *     19. Strict preservation of sent and unknown deliveries across cancellation.
  *  - Cleans up and verifies production DB `reachinbox` remains 100% untouched.
  */
 
@@ -1066,6 +1073,397 @@ async function runBatch6Verification(): Promise<void> {
         cancelIdempotent.status === 'cancelled',
         'Repeated cancel request is idempotent'
       );
+
+      // ---------------------------------------------------------------------
+      // TEST 13: Atomic Campaign Cancellation Commits All Tables
+      // ---------------------------------------------------------------------
+      console.log('\n' + SUB_SEP);
+      console.log('TEST 13: Atomic Campaign Cancellation Commits All Tables');
+      console.log(SUB_SEP);
+
+      const camp13Res = await testClient.query(
+        `INSERT INTO campaigns (user_id, sender_id, subject, body, status, hourly_limit)
+         VALUES ($1, $2, 'Batch 6.1 Atomic Cancel', 'Body', 'sending', 50)
+         RETURNING id;`,
+        [userAId, senderAId]
+      );
+      const camp13Id = camp13Res.rows[0].id;
+
+      const del13Pending = await createRecipientAndDelivery(
+        camp13Id,
+        senderAId,
+        'b61_pending@reachinbox.test',
+        'Pending Del',
+        'pending',
+        0
+      );
+      const del13RetryWait = await createRecipientAndDelivery(
+        camp13Id,
+        senderAId,
+        'b61_retry@reachinbox.test',
+        'Retry Del',
+        'retry_wait',
+        1,
+        'Temporary error',
+        'transient_failure'
+      );
+
+      // Create an outbox event for this campaign
+      await testClient.query(
+        `INSERT INTO delivery_outbox (event_type, aggregate_id, deduplication_key, payload, status)
+         VALUES ('send_email', $1, $2, '{"delivery_id": "dummy"}', 'pending');`,
+        [camp13Id, `outbox_${camp13Id}_1`]
+      );
+
+      const res13 = await cancelCampaign(camp13Id, userAId, testPool);
+      assert(res13.status === 'cancelled', 'Campaign status updated to cancelled');
+      assert(res13.cancelled_count === 2, 'Both pending and retry_wait deliveries cancelled');
+
+      // Verify campaign record
+      const c13 = await testClient.query(`SELECT status FROM campaigns WHERE id = $1;`, [camp13Id]);
+      assert(c13.rows[0].status === 'cancelled', 'Campaign status committed as cancelled');
+
+      // Verify delivery records
+      const d13Pending = await testClient.query(
+        `SELECT status, claim_owner, lease_expires_at, last_error FROM email_deliveries WHERE id = $1;`,
+        [del13Pending.deliveryId]
+      );
+      assert(d13Pending.rows[0].status === 'cancelled', 'Pending delivery committed as cancelled');
+      assert(d13Pending.rows[0].claim_owner === null && d13Pending.rows[0].lease_expires_at === null, 'Claim owner and lease cleared');
+      assert(d13Pending.rows[0].last_error === 'Campaign cancelled by operator', 'Last error updated to indicate operator cancellation');
+
+      const d13Retry = await testClient.query(
+        `SELECT status, claim_owner, lease_expires_at FROM email_deliveries WHERE id = $1;`,
+        [del13RetryWait.deliveryId]
+      );
+      assert(d13Retry.rows[0].status === 'cancelled', 'Retry_wait delivery committed as cancelled');
+
+      // Verify outbox records
+      const o13 = await testClient.query(`SELECT status, last_error FROM delivery_outbox WHERE aggregate_id = $1;`, [camp13Id]);
+      assert(o13.rows.length === 1 && o13.rows[0].status === 'failed', 'Pending outbox row failed');
+      assert(o13.rows[0].last_error === 'Campaign cancelled by operator', 'Outbox record reflects operator cancellation');
+
+      // ---------------------------------------------------------------------
+      // TEST 14: Injected Cancellation Failure Rolls Back All Tables Completely
+      // ---------------------------------------------------------------------
+      console.log('\n' + SUB_SEP);
+      console.log('TEST 14: Injected Cancellation Failure Rolls Back All Tables Completely');
+      console.log(SUB_SEP);
+
+      const camp14Res = await testClient.query(
+        `INSERT INTO campaigns (user_id, sender_id, subject, body, status, hourly_limit)
+         VALUES ($1, $2, 'Batch 6.1 Rollback Test', 'Body', 'sending', 50)
+         RETURNING id;`,
+        [userAId, senderAId]
+      );
+      const camp14Id = camp14Res.rows[0].id;
+
+      const del14 = await createRecipientAndDelivery(
+        camp14Id,
+        senderAId,
+        'b61_rollback@reachinbox.test',
+        'Rollback Del',
+        'pending',
+        0
+      );
+
+      await testClient.query(
+        `INSERT INTO delivery_outbox (event_type, aggregate_id, deduplication_key, payload, status)
+         VALUES ('send_email', $1, $2, '{"delivery_id": "dummy"}', 'pending');`,
+        [camp14Id, `outbox_${camp14Id}_1`]
+      );
+
+      let rollbackErrorThrown = false;
+      try {
+        await cancelCampaign(camp14Id, userAId, testPool, { injectFailure: true });
+      } catch (err: any) {
+        if (err.message && err.message.includes('Injected failure during campaign cancellation transaction')) {
+          rollbackErrorThrown = true;
+        }
+      }
+      assert(rollbackErrorThrown, 'Injected cancellation failure caught as expected');
+
+      // Verify complete rollback across all tables
+      const c14 = await testClient.query(`SELECT status FROM campaigns WHERE id = $1;`, [camp14Id]);
+      assert(c14.rows[0].status === 'sending', 'Campaign status rolled back to "sending"');
+
+      const d14 = await testClient.query(`SELECT status FROM email_deliveries WHERE id = $1;`, [del14.deliveryId]);
+      assert(d14.rows[0].status === 'pending', 'Delivery status rolled back to "pending"');
+
+      const o14 = await testClient.query(`SELECT status FROM delivery_outbox WHERE aggregate_id = $1;`, [camp14Id]);
+      assert(o14.rows[0].status === 'pending', 'Outbox status rolled back to "pending"');
+
+      // ---------------------------------------------------------------------
+      // TEST 15: Concurrent Cancellation Requests Remain Idempotent
+      // ---------------------------------------------------------------------
+      console.log('\n' + SUB_SEP);
+      console.log('TEST 15: Concurrent Cancellation Requests Remain Idempotent');
+      console.log(SUB_SEP);
+
+      const camp15Res = await testClient.query(
+        `INSERT INTO campaigns (user_id, sender_id, subject, body, status, hourly_limit)
+         VALUES ($1, $2, 'Batch 6.1 Concurrent Cancel', 'Body', 'sending', 50)
+         RETURNING id;`,
+        [userAId, senderAId]
+      );
+      const camp15Id = camp15Res.rows[0].id;
+
+      await createRecipientAndDelivery(
+        camp15Id,
+        senderAId,
+        'b61_concurrent_cancel@reachinbox.test',
+        'Concurrent Cancel Del',
+        'pending',
+        0
+      );
+
+      const [cRes1, cRes2] = await Promise.all([
+        cancelCampaign(camp15Id, userAId, testPool),
+        cancelCampaign(camp15Id, userAId, testPool),
+      ]);
+
+      assert(cRes1.success && cRes2.success, 'Both concurrent cancellation calls succeed');
+      assert(cRes1.status === 'cancelled' && cRes2.status === 'cancelled', 'Both return status "cancelled"');
+      const totalCancelled = (cRes1.cancelled_count || 0) + (cRes2.cancelled_count || 0);
+      assert(totalCancelled === 1, 'Exactly 1 delivery was cancelled across both concurrent requests');
+
+      // ---------------------------------------------------------------------
+      // TEST 16: Pause Racing with Delivery Claiming (Row-Locking Synchronization)
+      // ---------------------------------------------------------------------
+      console.log('\n' + SUB_SEP);
+      console.log('TEST 16: Pause Racing with Delivery Claiming (Row-Locking Synchronization)');
+      console.log(SUB_SEP);
+
+      const camp16Res = await testClient.query(
+        `INSERT INTO campaigns (user_id, sender_id, subject, body, status, hourly_limit)
+         VALUES ($1, $2, 'Batch 6.1 Pause Race', 'Body', 'sending', 50)
+         RETURNING id;`,
+        [userAId, senderAId]
+      );
+      const camp16Id = camp16Res.rows[0].id;
+
+      const del16 = await createRecipientAndDelivery(
+        camp16Id,
+        senderAId,
+        'b61_pause_race@reachinbox.test',
+        'Pause Race Del',
+        'pending',
+        0
+      );
+
+      // Concurrently run claimDelivery and pauseCampaign
+      const [claimResult16, pauseResult16] = await Promise.all([
+        claimDelivery({
+          campaignId: camp16Id,
+          recipientId: del16.recipientId,
+          claimOwner: 'worker_pause_race',
+          dbClient: testPool,
+        }),
+        pauseCampaign(camp16Id, userAId, testPool),
+      ]);
+
+      assert(pauseResult16.status === 'paused', 'Campaign paused successfully');
+      if (claimResult16 !== null) {
+        assert(pauseResult16.in_flight_count === 1, 'Claimed delivery is reported in in_flight_count');
+      } else {
+        assert(pauseResult16.in_flight_count === 0, 'In-flight count is 0 as pause preceded claim');
+      }
+
+      // Subsequent claim MUST be rejected after campaign is paused
+      const postPauseClaim = await claimDelivery({
+        campaignId: camp16Id,
+        recipientId: del16.recipientId,
+        claimOwner: 'worker_post_pause',
+        dbClient: testPool,
+      });
+      assert(postPauseClaim === null, 'No new delivery claim can succeed after campaign is paused');
+
+      // ---------------------------------------------------------------------
+      // TEST 17: Cancellation Racing with Delivery Claiming (Row-Locking Synchronization)
+      // ---------------------------------------------------------------------
+      console.log('\n' + SUB_SEP);
+      console.log('TEST 17: Cancellation Racing with Delivery Claiming (Row-Locking Synchronization)');
+      console.log(SUB_SEP);
+
+      const camp17Res = await testClient.query(
+        `INSERT INTO campaigns (user_id, sender_id, subject, body, status, hourly_limit)
+         VALUES ($1, $2, 'Batch 6.1 Cancel Race', 'Body', 'sending', 50)
+         RETURNING id;`,
+        [userAId, senderAId]
+      );
+      const camp17Id = camp17Res.rows[0].id;
+
+      const del17 = await createRecipientAndDelivery(
+        camp17Id,
+        senderAId,
+        'b61_cancel_race@reachinbox.test',
+        'Cancel Race Del',
+        'pending',
+        0
+      );
+
+      const [claimResult17, cancelResult17] = await Promise.all([
+        claimDelivery({
+          campaignId: camp17Id,
+          recipientId: del17.recipientId,
+          claimOwner: 'worker_cancel_race',
+          dbClient: testPool,
+        }),
+        cancelCampaign(camp17Id, userAId, testPool),
+      ]);
+
+      assert(cancelResult17.status === 'cancelled', 'Campaign cancelled successfully');
+      if (claimResult17 !== null) {
+        assert(cancelResult17.in_flight_count === 1, 'Claimed delivery is reported as in-flight during cancellation');
+        const d17 = await testClient.query(`SELECT status FROM email_deliveries WHERE id = $1;`, [claimResult17.id]);
+        assert(d17.rows[0].status === 'sending', 'In-flight sending delivery is preserved, not cancelled');
+      } else {
+        assert(cancelResult17.cancelled_count === 1, 'Delivery was cancelled by cancellation transaction');
+        const d17 = await testClient.query(`SELECT status FROM email_deliveries WHERE id = $1;`, [del17.deliveryId]);
+        assert(d17.rows[0].status === 'cancelled', 'Delivery transitioned to cancelled');
+      }
+
+      // Subsequent claim MUST be rejected after campaign is cancelled
+      const postCancelClaim = await claimDelivery({
+        campaignId: camp17Id,
+        recipientId: del17.recipientId,
+        claimOwner: 'worker_post_cancel',
+        dbClient: testPool,
+      });
+      assert(postCancelClaim === null, 'No new delivery claim can succeed after campaign is cancelled');
+
+      // ---------------------------------------------------------------------
+      // TEST 18: In-Flight Dispatches Counted and Active Dispatches Preserved
+      // ---------------------------------------------------------------------
+      console.log('\n' + SUB_SEP);
+      console.log('TEST 18: In-Flight Dispatches Counted and Active Dispatches Preserved');
+      console.log(SUB_SEP);
+
+      const camp18Res = await testClient.query(
+        `INSERT INTO campaigns (user_id, sender_id, subject, body, status, hourly_limit)
+         VALUES ($1, $2, 'Batch 6.1 In-Flight Test', 'Body', 'sending', 50)
+         RETURNING id;`,
+        [userAId, senderAId]
+      );
+      const camp18Id = camp18Res.rows[0].id;
+
+      // Create 2 active sending deliveries with future lease
+      const r18Active1 = await testClient.query(
+        `INSERT INTO recipients (campaign_id, email, name, status) VALUES ($1, 'a1@test.com', 'A1', 'pending') RETURNING id;`,
+        [camp18Id]
+      );
+      const d18Active1 = await testClient.query(
+        `INSERT INTO email_deliveries (campaign_id, recipient_id, sender_id, idempotency_key, status, claim_owner, lease_expires_at)
+         VALUES ($1, $2, $3, 'key_18_a1', 'sending', 'worker_1', NOW() + INTERVAL '5 minutes')
+         RETURNING id;`,
+        [camp18Id, r18Active1.rows[0].id, senderAId]
+      );
+
+      const r18Active2 = await testClient.query(
+        `INSERT INTO recipients (campaign_id, email, name, status) VALUES ($1, 'a2@test.com', 'A2', 'pending') RETURNING id;`,
+        [camp18Id]
+      );
+      const d18Active2 = await testClient.query(
+        `INSERT INTO email_deliveries (campaign_id, recipient_id, sender_id, idempotency_key, status, claim_owner, lease_expires_at)
+         VALUES ($1, $2, $3, 'key_18_a2', 'sending', 'worker_2', NOW() + INTERVAL '5 minutes')
+         RETURNING id;`,
+        [camp18Id, r18Active2.rows[0].id, senderAId]
+      );
+
+      // Create 1 expired sending delivery (stale lease)
+      const r18Expired = await testClient.query(
+        `INSERT INTO recipients (campaign_id, email, name, status) VALUES ($1, 'exp@test.com', 'Exp', 'pending') RETURNING id;`,
+        [camp18Id]
+      );
+      await testClient.query(
+        `INSERT INTO email_deliveries (campaign_id, recipient_id, sender_id, idempotency_key, status, claim_owner, lease_expires_at)
+         VALUES ($1, $2, $3, 'key_18_exp', 'sending', 'worker_3', NOW() - INTERVAL '5 minutes')
+         RETURNING id;`,
+        [camp18Id, r18Expired.rows[0].id, senderAId]
+      );
+
+      // Create 1 pending delivery
+      await createRecipientAndDelivery(
+        camp18Id,
+        senderAId,
+        'b61_pending_18@reachinbox.test',
+        'Pending 18',
+        'pending',
+        0
+      );
+
+      const cancelRes18 = await cancelCampaign(camp18Id, userAId, testPool);
+      assert(cancelRes18.status === 'cancelled', 'Campaign status updated to cancelled');
+      assert(cancelRes18.in_flight_count === 2, 'Accurately reports exactly 2 active in-flight dispatches (expired excluded)');
+      assert(cancelRes18.cancelled_count === 1, 'Only eligible pending delivery cancelled');
+
+      // Verify active sending deliveries are preserved
+      const checkA1 = await testClient.query(`SELECT status FROM email_deliveries WHERE id = $1;`, [d18Active1.rows[0].id]);
+      const checkA2 = await testClient.query(`SELECT status FROM email_deliveries WHERE id = $1;`, [d18Active2.rows[0].id]);
+      assert(checkA1.rows[0].status === 'sending' && checkA2.rows[0].status === 'sending', 'Active in-flight deliveries strictly preserved in "sending" status');
+
+      // ---------------------------------------------------------------------
+      // TEST 19: Strict Preservation of Sent and Unknown Deliveries across Cancellation
+      // ---------------------------------------------------------------------
+      console.log('\n' + SUB_SEP);
+      console.log('TEST 19: Strict Preservation of Sent and Unknown Deliveries across Cancellation');
+      console.log(SUB_SEP);
+
+      const camp19Res = await testClient.query(
+        `INSERT INTO campaigns (user_id, sender_id, subject, body, status, hourly_limit)
+         VALUES ($1, $2, 'Batch 6.1 Preserved Deliveries', 'Body', 'sending', 50)
+         RETURNING id;`,
+        [userAId, senderAId]
+      );
+      const camp19Id = camp19Res.rows[0].id;
+
+      const del19Sent = await createRecipientAndDelivery(
+        camp19Id,
+        senderAId,
+        'b61_sent@reachinbox.test',
+        'Sent Del',
+        'sent',
+        1,
+        null,
+        null,
+        '250 2.0.0 OK',
+        '<msg19@reachinbox.test>'
+      );
+      await testClient.query(
+        `UPDATE email_deliveries SET sent_at = NOW() - INTERVAL '1 hour' WHERE id = $1;`,
+        [del19Sent.deliveryId]
+      );
+
+      const del19Unknown = await createRecipientAndDelivery(
+        camp19Id,
+        senderAId,
+        'b61_unknown@reachinbox.test',
+        'Unknown Del',
+        'unknown',
+        1,
+        'Ambiguous SMTP outcome',
+        'ambiguous_outcome'
+      );
+
+      const cancelRes19 = await cancelCampaign(camp19Id, userAId, testPool);
+      assert(cancelRes19.status === 'cancelled', 'Campaign cancelled successfully');
+
+      // Verify sent delivery is strictly untouched
+      const check19Sent = await testClient.query(
+        `SELECT status, sent_at, smtp_message_id FROM email_deliveries WHERE id = $1;`,
+        [del19Sent.deliveryId]
+      );
+      assert(check19Sent.rows[0].status === 'sent', 'Sent delivery strictly remains "sent"');
+      assert(check19Sent.rows[0].sent_at !== null, 'sent_at timestamp preserved');
+      assert(check19Sent.rows[0].smtp_message_id === '<msg19@reachinbox.test>', 'smtp_message_id preserved');
+
+      // Verify unknown delivery is strictly untouched
+      const check19Unknown = await testClient.query(
+        `SELECT status, last_error FROM email_deliveries WHERE id = $1;`,
+        [del19Unknown.deliveryId]
+      );
+      assert(check19Unknown.rows[0].status === 'unknown', 'Unknown delivery strictly remains "unknown"');
+      assert(check19Unknown.rows[0].last_error === 'Ambiguous SMTP outcome', 'Unknown last_error preserved');
 
     } finally {
       await testClient.end();

@@ -127,6 +127,10 @@ export interface ResolveUnknownResult {
   delivery: EmailDeliveryRow;
 }
 
+export interface CancelCampaignOptions {
+  injectFailure?: boolean;
+}
+
 export interface CampaignControlResult {
   success: boolean;
   campaign_id: string;

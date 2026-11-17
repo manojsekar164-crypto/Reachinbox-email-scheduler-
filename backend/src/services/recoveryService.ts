@@ -51,6 +51,7 @@ import {
   ManualRetryResult,
   ResolveUnknownInput,
   ResolveUnknownResult,
+  CancelCampaignOptions,
   CampaignControlResult,
   DeliveryResolutionRow,
 } from '../types/recovery.types';
@@ -909,6 +910,8 @@ export async function resolveUnknownDelivery(
  * Pauses a campaign atomically.
  *
  * Invariants:
+ *  - Uses a dedicated client and explicit transaction.
+ *  - Locks campaign row FOR UPDATE to establish consistent locking order (campaigns -> deliveries).
  *  - Prevents new delivery claims (claimDelivery checks status = 'sending').
  *  - Accurately reports currently in-flight dispatches.
  *  - Idempotent: repeated pause requests return success.
@@ -916,72 +919,93 @@ export async function resolveUnknownDelivery(
 export async function pauseCampaign(
   campaignId: string,
   userId: string,
-  client: Pool | PoolClient = defaultPool
+  dbPool: Pool | PoolClient = defaultPool
 ): Promise<CampaignControlResult> {
-  const campRes = await client.query(
-    `SELECT id, status FROM campaigns WHERE id = $1 AND user_id = $2 LIMIT 1;`,
-    [campaignId, userId]
-  );
+  const isPool = dbPool instanceof Pool || typeof (dbPool as any).totalCount === 'number';
+  const client = isPool ? await (dbPool as Pool).connect() : (dbPool as PoolClient);
 
-  if (campRes.rows.length === 0) {
-    const error: any = new Error('Campaign not found or access denied');
-    error.statusCode = 404;
-    throw error;
-  }
+  try {
+    await client.query('BEGIN');
 
-  const campaign = campRes.rows[0];
+    // 1. Lock campaign row for update and verify ownership
+    const campRes = await client.query(
+      `SELECT id, status FROM campaigns WHERE id = $1 AND user_id = $2 FOR UPDATE;`,
+      [campaignId, userId]
+    );
 
-  if (campaign.status === 'completed' || campaign.status === 'cancelled') {
-    const error: any = new Error(`Cannot pause a ${campaign.status} campaign`);
-    error.statusCode = 400;
-    throw error;
-  }
+    if (campRes.rows.length === 0) {
+      const error: any = new Error('Campaign not found or access denied');
+      error.statusCode = 404;
+      throw error;
+    }
 
-  if (campaign.status === 'paused') {
+    const campaign = campRes.rows[0];
+
+    if (campaign.status === 'completed' || campaign.status === 'cancelled') {
+      const error: any = new Error(`Cannot pause a ${campaign.status} campaign`);
+      error.statusCode = 400;
+      throw error;
+    }
+
+    if (campaign.status === 'paused') {
+      await client.query('COMMIT');
+      return {
+        success: true,
+        campaign_id: campaignId,
+        previous_status: 'paused',
+        status: 'paused',
+        message: 'Campaign is already paused',
+        in_flight_count: 0,
+      };
+    }
+
+    // 2. Count currently in-flight dispatches
+    const inFlightRes = await client.query<{ count: string }>(
+      `SELECT COUNT(*) AS count
+       FROM email_deliveries
+       WHERE campaign_id = $1
+         AND status = 'sending'
+         AND lease_expires_at IS NOT NULL
+         AND lease_expires_at > NOW()
+         AND deleted_at IS NULL;`,
+      [campaignId]
+    );
+    const inFlightCount = parseInt(inFlightRes.rows[0]?.count || '0', 10);
+
+    // 3. Update campaign status to 'paused'
+    await client.query(
+      `UPDATE campaigns
+       SET status = 'paused',
+           updated_at = NOW()
+       WHERE id = $1;`,
+      [campaignId]
+    );
+
+    await client.query('COMMIT');
+
+    const message =
+      inFlightCount > 0
+        ? `Campaign paused. ${inFlightCount} in-flight dispatches are completing and cannot be cancelled immediately.`
+        : 'Campaign paused successfully. No new delivery claims will be processed.';
+
     return {
       success: true,
       campaign_id: campaignId,
-      previous_status: 'paused',
+      previous_status: campaign.status,
       status: 'paused',
-      message: 'Campaign is already paused',
-      in_flight_count: 0,
+      message,
+      in_flight_count: inFlightCount,
     };
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (_) {}
+    throw err;
+  } finally {
+    if (isPool) {
+      (client as PoolClient).release();
+    }
   }
-
-  // Count currently in-flight dispatches
-  const inFlightRes = await client.query<{ count: string }>(
-    `SELECT COUNT(*) AS count
-     FROM email_deliveries
-     WHERE campaign_id = $1
-       AND status = 'sending'
-       AND lease_expires_at IS NOT NULL
-       AND lease_expires_at > NOW()
-       AND deleted_at IS NULL;`,
-    [campaignId]
-  );
-  const inFlightCount = parseInt(inFlightRes.rows[0]?.count || '0', 10);
-
-  await client.query(
-    `UPDATE campaigns
-     SET status = 'paused',
-         updated_at = NOW()
-     WHERE id = $1;`,
-    [campaignId]
-  );
-
-  const message =
-    inFlightCount > 0
-      ? `Campaign paused. ${inFlightCount} in-flight dispatches are completing and cannot be cancelled immediately.`
-      : 'Campaign paused successfully. No new delivery claims will be processed.';
-
-  return {
-    success: true,
-    campaign_id: campaignId,
-    previous_status: campaign.status,
-    status: 'paused',
-    message,
-    in_flight_count: inFlightCount,
-  };
 }
 
 /**
@@ -1111,87 +1135,137 @@ export async function resumeCampaign(
  * Cancels a campaign atomically.
  *
  * Invariants:
- *  - Transitions campaign status to 'cancelled'.
- *  - Atomically cancels all outstanding non-terminal deliveries ('pending', 'scheduled', 'retry_wait').
- *  - Never reactivates sent or unknown deliveries.
- *  - Cancels pending outbox events for this campaign.
- *  - Idempotent: repeated cancellation requests return success.
+ *  - Uses a dedicated PostgreSQL client and explicit transaction.
+ *  - Locks and verifies campaign ownership before modifying anything.
+ *  - Updates campaign status, eligible delivery records and pending outbox events in the same transaction.
+ *  - Rolls back all changes if any operation fails.
+ *  - Preserves sent and unknown deliveries.
+ *  - Preserves active SMTP operations and reports their in-flight count.
+ *  - Repeated cancellation requests are idempotent.
+ *  - Never silently leaves partially cancelled campaign state.
  */
 export async function cancelCampaign(
   campaignId: string,
   userId: string,
-  client: Pool | PoolClient = defaultPool
+  dbPool: Pool | PoolClient = defaultPool,
+  options?: CancelCampaignOptions
 ): Promise<CampaignControlResult> {
-  const campRes = await client.query(
-    `SELECT id, status FROM campaigns WHERE id = $1 AND user_id = $2 LIMIT 1;`,
-    [campaignId, userId]
-  );
+  const isPool = dbPool instanceof Pool || typeof (dbPool as any).totalCount === 'number';
+  const client = isPool ? await (dbPool as Pool).connect() : (dbPool as PoolClient);
 
-  if (campRes.rows.length === 0) {
-    const error: any = new Error('Campaign not found or access denied');
-    error.statusCode = 404;
-    throw error;
-  }
+  try {
+    await client.query('BEGIN');
 
-  const campaign = campRes.rows[0];
+    // 1. Lock and verify campaign ownership before modifying anything
+    const campRes = await client.query(
+      `SELECT id, status FROM campaigns WHERE id = $1 AND user_id = $2 FOR UPDATE;`,
+      [campaignId, userId]
+    );
 
-  if (campaign.status === 'cancelled') {
+    if (campRes.rows.length === 0) {
+      const error: any = new Error('Campaign not found or access denied');
+      error.statusCode = 404;
+      throw error;
+    }
+
+    const campaign = campRes.rows[0];
+
+    // Idempotent: repeated cancellation requests return success
+    if (campaign.status === 'cancelled') {
+      await client.query('COMMIT');
+      return {
+        success: true,
+        campaign_id: campaignId,
+        previous_status: 'cancelled',
+        status: 'cancelled',
+        message: 'Campaign is already cancelled',
+        cancelled_count: 0,
+        in_flight_count: 0,
+      };
+    }
+
+    // 2. Preserve active SMTP operations and report their in-flight count
+    const inFlightRes = await client.query<{ count: string }>(
+      `SELECT COUNT(*) AS count
+       FROM email_deliveries
+       WHERE campaign_id = $1
+         AND status = 'sending'
+         AND lease_expires_at IS NOT NULL
+         AND lease_expires_at > NOW()
+         AND deleted_at IS NULL;`,
+      [campaignId]
+    );
+    const inFlightCount = parseInt(inFlightRes.rows[0]?.count || '0', 10);
+
+    // 3. Update campaign status to 'cancelled'
+    await client.query(
+      `UPDATE campaigns
+       SET status = 'cancelled',
+           updated_at = NOW()
+       WHERE id = $1;`,
+      [campaignId]
+    );
+
+    // 4. Update eligible delivery records
+    // Eligible: 'pending', 'scheduled', 'retry_wait'
+    // STRICTLY PRESERVE 'sent', 'unknown', and active 'sending'
+    const cancelDeliveriesRes = await client.query<{ id: string }>(
+      `UPDATE email_deliveries
+       SET status = 'cancelled',
+           last_error = 'Campaign cancelled by operator',
+           claim_owner = NULL,
+           lease_expires_at = NULL,
+           next_attempt_at = NULL,
+           updated_at = NOW()
+       WHERE campaign_id = $1
+         AND status IN ('pending', 'scheduled', 'retry_wait')
+         AND deleted_at IS NULL
+       RETURNING id;`,
+      [campaignId]
+    );
+    const cancelledCount = cancelDeliveriesRes.rows.length;
+
+    // 5. Cancel pending/processing outbox events for this campaign
+    await client.query(
+      `UPDATE delivery_outbox
+       SET status = 'failed',
+           last_error = 'Campaign cancelled by operator',
+           claim_owner = NULL,
+           lease_expires_at = NULL
+       WHERE aggregate_id = $1
+         AND status IN ('pending', 'processing');`,
+      [campaignId]
+    );
+
+    // Optional test failure injection to verify transaction rollback atomicity
+    if (options?.injectFailure) {
+      throw new Error('Injected failure during campaign cancellation transaction');
+    }
+
+    await client.query('COMMIT');
+
+    const message =
+      inFlightCount > 0
+        ? `Campaign cancelled. ${cancelledCount} outstanding deliveries cancelled. ${inFlightCount} active in-flight dispatches are completing.`
+        : `Campaign cancelled successfully. ${cancelledCount} outstanding deliveries cancelled.`;
+
     return {
       success: true,
       campaign_id: campaignId,
-      previous_status: 'cancelled',
+      previous_status: campaign.status,
       status: 'cancelled',
-      message: 'Campaign is already cancelled',
-      cancelled_count: 0,
+      message,
+      cancelled_count: cancelledCount,
+      in_flight_count: inFlightCount,
     };
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (_) {}
+    throw err;
+  } finally {
+    if (isPool) {
+      (client as PoolClient).release();
+    }
   }
-
-  // Cancel campaign record
-  await client.query(
-    `UPDATE campaigns
-     SET status = 'cancelled',
-         updated_at = NOW()
-     WHERE id = $1;`,
-    [campaignId]
-  );
-
-  // Cancel outstanding non-terminal deliveries
-  // STRICTLY preserve 'sent' and 'unknown' deliveries
-  const cancelDeliveriesRes = await client.query<{ id: string }>(
-    `UPDATE email_deliveries
-     SET status = 'cancelled',
-         last_error = 'Campaign cancelled by operator',
-         claim_owner = NULL,
-         lease_expires_at = NULL,
-         next_attempt_at = NULL,
-         updated_at = NOW()
-     WHERE campaign_id = $1
-       AND status IN ('pending', 'scheduled', 'retry_wait')
-       AND deleted_at IS NULL
-     RETURNING id;`,
-    [campaignId]
-  );
-
-  const cancelledCount = cancelDeliveriesRes.rows.length;
-
-  // Cancel pending outbox records
-  await client.query(
-    `UPDATE delivery_outbox
-     SET status = 'failed',
-         last_error = 'Campaign cancelled by operator',
-         claim_owner = NULL,
-         lease_expires_at = NULL
-     WHERE aggregate_id = $1
-       AND status IN ('pending', 'processing');`,
-    [campaignId]
-  );
-
-  return {
-    success: true,
-    campaign_id: campaignId,
-    previous_status: campaign.status,
-    status: 'cancelled',
-    message: `Campaign cancelled successfully. ${cancelledCount} outstanding deliveries cancelled.`,
-    cancelled_count: cancelledCount,
-  };
 }

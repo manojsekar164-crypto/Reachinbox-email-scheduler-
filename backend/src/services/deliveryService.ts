@@ -171,9 +171,9 @@ export async function claimDelivery(
   const query = `
     WITH claimable AS (
       SELECT ed.id
-      FROM email_deliveries ed
-      JOIN campaigns c ON c.id = ed.campaign_id
-      WHERE ed.campaign_id = $1
+      FROM campaigns c
+      JOIN email_deliveries ed ON ed.campaign_id = c.id
+      WHERE c.id = $1
         AND ed.recipient_id = $2
         AND ed.deleted_at IS NULL
         AND c.status = 'sending'
@@ -182,6 +182,7 @@ export async function claimDelivery(
           OR (ed.status = 'retry_wait' AND (ed.next_attempt_at IS NULL OR ed.next_attempt_at <= NOW()))
           OR (ed.status = 'scheduled' AND (ed.scheduled_at IS NULL OR ed.scheduled_at <= NOW()))
         )
+      FOR SHARE OF c
       FOR UPDATE OF ed SKIP LOCKED
       LIMIT 1
     )
