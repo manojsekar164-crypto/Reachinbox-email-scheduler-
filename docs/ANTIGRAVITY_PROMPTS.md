@@ -198,3 +198,155 @@ After setup, report:
 DO NOT IMPLEMENT DATABASE CHANGES YET.
 Wait for Phase 1 instructions.
 ```
+
+
+---
+
+## Prompt 4: Stage 1 Database Migrations & Delivery Model Execution
+
+**Date:** 2026-11-17T12:02:20+05:30  
+**Branch:** `feat/database-foundation`  
+**Working Directory:** `D:\Devops projects\ReachInbox-canonical`  
+**Prompt Content:**
+```text
+# REACHINBOX — PHASE 1 IMPLEMENTATION
+
+ROLE:
+You are a Senior PostgreSQL Architect,
+Database Security Engineer and Distributed
+Systems Engineer.
+
+PROJECT:
+ReachInbox — Intelligent Email Delivery Platform.
+
+REPOSITORY:
+https://github.com/manojsekar164-crypto/Reachinbox-email-scheduler-.git
+
+CURRENT BRANCH:
+feat/database-foundation
+
+CURRENT BASELINE:
+47c7ada
+
+WORKING DIRECTORY:
+D:\Devops projects\ReachInbox-canonical
+
+--------------------------------------------------
+1. FIRST READ ALL PROJECT DOCUMENTATION
+--------------------------------------------------
+
+Read these files completely:
+
+docs/PHASE_0_AUDIT.md
+docs/ANTIGRAVITY_WORKING_BRIEF.md
+docs/ANTIGRAVITY_PROMPTS.md
+docs/IMPLEMENTATION_LOG.md
+README.md
+backend/README.md
+
+Understand the entire existing backend before
+making any modifications.
+
+The Phase 0 audit identified 18 findings.
+
+Use the audit as the implementation reference.
+
+Do not rebuild the existing application.
+
+--------------------------------------------------
+2. OFFICIAL DEVELOPMENT ROADMAP
+--------------------------------------------------
+
+We are following this exact order:
+
+Stage 0: Existing project audit
+Stage 1: Database migrations and delivery model
+Stage 2: Transactional outbox and queue persistence
+Stage 3: Idempotency and configurable workers
+Stage 4: Rate limiting and minimum delay
+Stage 5: SMTP and Slack integration
+Stage 6: Elasticsearch and Google OAuth verification
+Stage 7: Preflight and delivery forecast
+Stage 8: Sender health monitor
+Stage 9: Failure and recovery centre
+Stage 10: AI Copilot
+Stage 11: Frontend integration
+Stage 12: Testing, README, GitHub and video
+
+CURRENT TASK:
+Stage 1 ONLY.
+
+Do not automatically begin Stage 2.
+
+--------------------------------------------------
+3. NON-NEGOTIABLE CONSTRAINTS
+--------------------------------------------------
+
+ABSOLUTELY NO CRON JOBS.
+
+Prohibited:
+- OS cron
+- crontab
+- node-cron
+- agenda
+- Any cron-based scheduling library
+
+Scheduling must use BullMQ delayed jobs or
+a compliant persistent DB/Redis scheduler.
+
+PostgreSQL must remain the permanent
+source of truth.
+
+Future scheduled jobs must survive restarts.
+
+Already-sent emails must never be blindly
+restarted or sent again.
+
+Maintain per-delivery idempotency.
+
+Never fake SMTP success.
+
+Never delete existing working functionality.
+
+Never reset or drop existing production data.
+
+Never commit secrets or .env files.
+
+--------------------------------------------------
+4. STAGE 1 IMPLEMENTATION
+--------------------------------------------------
+
+OBJECTIVE:
+
+Build a reliable database foundation that
+supports individual email delivery tracking,
+historical data preservation and future
+distributed worker processing.
+
+A. MIGRATION VERSION TRACKING
+B. EMAIL DELIVERY DATA MODEL
+C. DELIVERY STATUS MODEL
+D. EMAIL ATTEMPT HISTORY
+E. TRANSACTIONAL OUTBOX SCHEMA
+F. HISTORICAL DATA BACKFILL
+G. SMTP CREDENTIAL ENCRYPTION
+H. DATABASE TYPE CONSISTENCY
+
+--------------------------------------------------
+5. DATABASE SAFETY REQUIREMENTS
+--------------------------------------------------
+6. TEST REQUIREMENTS
+--------------------------------------------------
+7. TEST AND BUILD
+--------------------------------------------------
+8. DOCUMENTATION
+--------------------------------------------------
+9. GIT REQUIREMENTS
+--------------------------------------------------
+10. DEFINITION OF DONE
+--------------------------------------------------
+FINAL REPORT REQUIRED
+
+STOP AFTER PHASE 1.
+WAIT FOR EXPLICIT APPROVAL BEFORE STAGE 2.
+```

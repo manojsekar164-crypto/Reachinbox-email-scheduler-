@@ -124,11 +124,41 @@ backend/
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PORT` | `5000` | HTTP server port |
-| `NODE_ENV` | `development` | Environment mode |
+| `PORT` | `5001` | HTTP server port |
+| `NODE_ENV` | `development` | Environment mode (`development`, `production`, `test`) |
 | `DATABASE_URL` | `postgresql://postgres:postgres@localhost:5432/reachinbox` | Postgres connection string |
 | `REDIS_HOST` | `localhost` | Redis hostname |
 | `REDIS_PORT` | `6379` | Redis port |
+| `WORKER_CONCURRENCY` | `2` | Number of concurrent jobs per BullMQ email worker instance |
+| `ENCRYPTION_KEY` | *(required in prod)* | 32-byte secret (hex/base64/passphrase) for AES-256-GCM credential encryption |
+
+---
+
+## Database Architecture & Migration Engine (Stage 1)
+
+The platform uses a versioned, tamper-evident PostgreSQL migration runner with session-level advisory locking (`pg_advisory_lock(7142981)`).
+
+### Applied Migrations
+1. `001_initial_schema.sql` – Core entities: `users`, `campaigns`, `recipients`, `email_logs`.
+2. `002_add_senders.sql` – Multi-sender configuration: `senders` table with SMTP credentials.
+3. `003_add_slack_integrations.sql` – Slack webhook & OAuth integrations: `slack_integrations`.
+4. `004_create_delivery_and_outbox_schema.sql` – Durable delivery & outbox architecture:
+   - `schema_migrations`: Immutable tracking table storing file names, timestamps, and SHA-256 checksums.
+   - `senders.hourly_limit`: Shared sender-level hourly sending rate limit.
+   - `idx_email_logs_idempotency`: Partial unique index on `email_logs (campaign_id, recipient_id) WHERE status = 'sent'`.
+   - `email_deliveries`: Canonical delivery state machine (`pending`, `scheduled`, `sending`, `retry_wait`, `sent`, `failed`, `unknown`, `cancelled`) with unique `idempotency_key` and `(campaign_id, recipient_id)`.
+   - `email_attempts`: Immutable audit log for every delivery attempt (`attempting`, `sent`, `failed`, `unknown`, `rate_limited`).
+   - `delivery_outbox`: Transactional outbox table (`pending`, `processing`, `dispatched`, `failed`) with deduplication constraint `uq_delivery_outbox_dedup`.
+5. `005_backfill_historical_deliveries.sql` – Safe historical migration:
+   - Backfills historical recipients and campaigns into `email_deliveries` with state preservation.
+   - Backfills historical logs into `email_attempts`.
+
+### Cryptographic Security at Rest
+- Sensitive SMTP passwords in `senders.smtp_pass` are protected using authenticated **AES-256-GCM** with 96-bit random IVs and 128-bit authentication tags.
+- Ciphertext format: `enc:v1:<iv_hex_24>:<auth_tag_hex_32>:<cipher_hex>`.
+- Fail-closed security in production (`NODE_ENV=production` rejects startup without `ENCRYPTION_KEY`).
+- One-time credential migration command: `npm run credentials:migrate`.
+- Stage 1 verification command: `npm run stage1:test`.
 
 ---
 

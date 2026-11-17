@@ -5,12 +5,15 @@
  *
  * Key features:
  *  - Raw SQL queries via pg pool following existing database service conventions.
+ *  - Transparent AES-256-GCM authenticated credential encryption at rest.
  *  - Restricts access strictly to the owner using `user_id = $N`.
  *  - Handles sender deletions, throwing descriptive errors if foreign key restrains deletion.
+ *  - Supports shared sender-level hourly rate limits.
  */
 
 import { db } from '../db/postgres';
 import { SenderRow } from '../types/db.types';
+import { safeEncrypt, safeDecrypt } from '../utils/crypto';
 
 export interface CreateSenderInput {
   name: string;
@@ -20,6 +23,7 @@ export interface CreateSenderInput {
   smtp_secure: boolean;
   smtp_user: string;
   smtp_pass: string;
+  hourly_limit?: number;
 }
 
 export interface UpdateSenderInput {
@@ -30,18 +34,31 @@ export interface UpdateSenderInput {
   smtp_secure?: boolean;
   smtp_user?: string;
   smtp_pass?: string;
+  hourly_limit?: number;
+}
+
+function mapSenderRow(row: SenderRow | null): SenderRow | null {
+  if (!row) return null;
+  return {
+    ...row,
+    smtp_pass: safeDecrypt(row.smtp_pass),
+    hourly_limit: row.hourly_limit ?? 100,
+  };
 }
 
 /**
- * Creates a new sender record.
+ * Creates a new sender record with credentials encrypted at rest.
  */
 export async function createSender(
   userId: string,
   input: CreateSenderInput
 ): Promise<SenderRow> {
+  const encryptedPass = safeEncrypt(input.smtp_pass);
+  const hourlyLimit = input.hourly_limit && input.hourly_limit > 0 ? input.hourly_limit : 100;
+
   const { rows } = await db.query<SenderRow>(
-    `INSERT INTO senders (user_id, name, email, smtp_host, smtp_port, smtp_secure, smtp_user, smtp_pass)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    `INSERT INTO senders (user_id, name, email, smtp_host, smtp_port, smtp_secure, smtp_user, smtp_pass, hourly_limit)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      RETURNING *`,
     [
       userId,
@@ -51,21 +68,22 @@ export async function createSender(
       input.smtp_port,
       input.smtp_secure,
       input.smtp_user,
-      input.smtp_pass,
+      encryptedPass,
+      hourlyLimit,
     ]
   );
-  return rows[0]!;
+  return mapSenderRow(rows[0]!)!;
 }
 
 /**
- * Lists all senders for the authenticated user.
+ * Lists all senders for the authenticated user with decrypted credentials for authorized operations.
  */
 export async function listSendersByUser(userId: string): Promise<SenderRow[]> {
   const { rows } = await db.query<SenderRow>(
     `SELECT * FROM senders WHERE user_id = $1 ORDER BY created_at DESC`,
     [userId]
   );
-  return rows;
+  return rows.map((r) => mapSenderRow(r)!);
 }
 
 /**
@@ -79,7 +97,7 @@ export async function getSenderById(
     `SELECT * FROM senders WHERE id = $1 AND user_id = $2`,
     [id, userId]
   );
-  return rows[0] ?? null;
+  return mapSenderRow(rows[0] ?? null);
 }
 
 /**
@@ -92,7 +110,7 @@ export async function getSenderByIdInternal(
     `SELECT * FROM senders WHERE id = $1`,
     [id]
   );
-  return rows[0] ?? null;
+  return mapSenderRow(rows[0] ?? null);
 }
 
 /**
@@ -133,7 +151,11 @@ export async function updateSender(
   }
   if (updates.smtp_pass !== undefined) {
     setClauses.push(`smtp_pass = $${idx++}`);
-    values.push(updates.smtp_pass);
+    values.push(safeEncrypt(updates.smtp_pass));
+  }
+  if (updates.hourly_limit !== undefined) {
+    setClauses.push(`hourly_limit = $${idx++}`);
+    values.push(updates.hourly_limit);
   }
 
   if (setClauses.length === 0) {
@@ -153,7 +175,7 @@ export async function updateSender(
   `;
 
   const { rows } = await db.query<SenderRow>(sql, values);
-  return rows[0] ?? null;
+  return mapSenderRow(rows[0] ?? null);
 }
 
 /**
@@ -164,7 +186,6 @@ export async function deleteSenderForUser(
   id: string,
   userId: string
 ): Promise<boolean> {
-  // First, verify ownership and existence
   const sender = await getSenderById(id, userId);
   if (!sender) {
     return false;

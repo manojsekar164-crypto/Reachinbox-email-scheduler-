@@ -118,6 +118,8 @@ Frontend UI will start on `http://localhost:5173`.
 | `DATABASE_URL` | PostgreSQL connection URL | `postgresql://postgres:postgres@localhost:5432/reachinbox` |
 | `REDIS_HOST` | Redis host | `localhost` |
 | `REDIS_PORT` | Redis port | `6379` |
+| `WORKER_CONCURRENCY` | Concurrent jobs per worker instance | `2` |
+| `ENCRYPTION_KEY` | 32-byte secret for AES-256-GCM credential encryption | *(required in prod)* |
 | `SESSION_SECRET` | Express session encryption secret | 64-char hex string |
 | `GOOGLE_CLIENT_ID` | Google OAuth client ID | (Configured) |
 | `GOOGLE_CLIENT_SECRET`| Google OAuth client secret | (Configured) |

@@ -13,11 +13,17 @@ function getEnv(key: string, defaultValue = ''): string {
 // ─── Config Object ────────────────────────────────────────────────────────────
 export const config = {
   app: {
-    port: parseInt(process.env['PORT'] ?? '5000', 10),
+    port: parseInt(process.env['PORT'] ?? '5001', 10),
     nodeEnv: process.env['NODE_ENV'] ?? 'development',
     isDev: (process.env['NODE_ENV'] ?? 'development') === 'development',
     isProd: process.env['NODE_ENV'] === 'production',
     rateLimitWindow: parseInt(process.env['RATE_LIMIT_WINDOW_SECONDS'] ?? '3600', 10),
+    workerConcurrency: (() => {
+      const val = process.env['WORKER_CONCURRENCY'];
+      if (!val) return 2;
+      const parsed = parseInt(val, 10);
+      return Number.isInteger(parsed) && parsed > 0 ? parsed : 2;
+    })(),
     emailSendDelayMs: (() => {
       const val = process.env['SEND_DELAY_TEST_MS'] ?? process.env['EMAIL_SEND_DELAY_MS'];
       if (val === undefined || val === '') {
@@ -59,9 +65,13 @@ export const config = {
       'http://localhost:5001/auth/slack/callback',
   },
 
-  // ─── Session ─────────────────────────────────────────────────────────────────
+  // ─── Session & Encryption ────────────────────────────────────────────────────
   session: {
     secret: getEnv('SESSION_SECRET', 'reachinbox-default-secret-key-32chars-min!!'),
+  },
+
+  crypto: {
+    encryptionKey: process.env['ENCRYPTION_KEY'] || '',
   },
 
   // ─── SMTP / Ethereal ────────────────────────────────────────────────────────

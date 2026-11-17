@@ -13,6 +13,7 @@ const poolConfig: PoolConfig = {
 };
 
 export const db = new Pool(poolConfig);
+export const pool = db;
 
 /**
  * Verify the database connection.
