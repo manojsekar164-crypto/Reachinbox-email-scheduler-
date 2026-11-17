@@ -976,3 +976,51 @@ Implement a dedicated Operations Intelligence Data Service (`operationsIntellige
 | Batch 1 Regression Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
 | TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
 | Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched |
+
+---
+
+## 2026-11-17 – Entry 018: Batch 7A.1 – Operations Intelligence Accuracy and Queue Isolation
+
+### Scope & Objective
+Refine the Operations Intelligence Data Service (`operationsIntelligenceService.ts`) to fix two critical accuracy and data isolation defects:
+1. **Attempt-Level Metrics Accuracy**:
+   - Derive confirmed SMTP acceptances strictly from `email_attempts` records with status `'sent'` having genuine SMTP acceptance evidence (`smtp_response_code` or `smtp_message_id`).
+   - Derive confirmed failures strictly from `email_attempts` records with status `'failed'`.
+   - Derive unknown outcomes strictly from `email_attempts` records with status `'unknown'`.
+   - Prevent operator-resolved accepted deliveries (without genuine SMTP evidence) from being conflated with confirmed SMTP acceptances.
+   - Correct `getDeliveryFailureIntelligence().total_attempts` to directly count `email_attempts` via `COUNT(ea.id)` rather than grouping delivery classifications.
+   - Maintain strict separation between unique delivery targets and total dispatch attempts.
+   - Exclude unknown outcomes from success and failure rate denominators (`sent / (sent + failed)`).
+2. **Queue Tenant Isolation & Complete Count Handling**:
+   - Completely eliminate exposure of cross-tenant global queue counts and backlogs in tenant-facing responses and AI context documents (`global_counts: null`, `count_scope: 'tenant_scoped'`).
+   - Implement chunked queue inspection (`scanStateJobs`) paginating in slices of 500 up to `sampleLimit` (default: 2500) to accurately support BullMQ queue depths > 500 jobs without missing jobs or causing memory exhaustion.
+   - Explicitly flag partial sampling via `is_partial: true`, `sample_limit`, and diagnostic notes whenever queue depth exceeds the sample limit; never represent a truncated count as exact.
+   - Gracefully handle Redis unavailability without fabricating exact counts.
+
+### Key Implementations & Enhancements
+1. **Attempt Metric Derivation (`operationsIntelligenceService.ts` & `operationsIntelligence.types.ts`)**:
+   - `getSenderPerformanceIntelligence`: Updated CTEs so `delivery_stats` provides `unique_deliveries`, `sent_deliveries`, `failed_deliveries`, `unknown_deliveries`, while `attempt_stats` provides `total_attempts`, `confirmed_smtp_acceptances` (checking `smtp_response_code IS NOT NULL OR smtp_message_id IS NOT NULL`), `confirmed_failures`, and `unknown_outcomes`.
+   - `getDeliveryFailureIntelligence`: Total attempts query simplified to `SELECT COUNT(ea.id)::int AS total_attempts FROM email_attempts ea JOIN email_deliveries ed ON ed.id = ea.delivery_id JOIN campaigns c ON c.id = ed.campaign_id WHERE c.user_id = $1`.
+2. **Queue Isolation & Pagination (`operationsIntelligenceService.ts`)**:
+   - Implemented `scanStateJobs` helper to fetch BullMQ jobs in chunks of 500 up to `sampleLimit`.
+   - Populated `user_backlog`, `user_counts`, `count_scope: 'tenant_scoped'`, `is_partial`, and `sample_limit`.
+   - Set `global_counts: null` and strictly tenant-scoped queue summaries in `getOperationsContext`.
+3. **Verification Test Suite Expansion (`testBatch7AOperationsIntelligence.ts`)**:
+   - Added Test 3B: Verifying operator-confirmed acceptance without SMTP evidence is not counted as a verified SMTP acceptance.
+   - Updated Test 5: Asserted `failIntel.total_attempts === 13`.
+   - Updated Tests 6, 7 & 12: Verified tenant isolation, zero global queue leak, and tenant-scoped backlog.
+   - Added Test 7B: Tested queue depth > 500 jobs (601 waiting jobs) with pagination and bounded partial scan (`sampleLimit = 300` -> `is_partial === true`).
+
+### Actual Test Results
+
+| Test Suite | Command | Result | Notes |
+|---|---|---|---|
+| Batch 7A & 7A.1 Verification Suite | `npm run batch7a:test` | ✅ PASS | 104/104 assertions passed across all 15 test scenarios |
+| Batch 6 & 6.1 Verification Suite | `npm run batch6:test` | ✅ PASS | 108/108 assertions passed across all 19 test scenarios |
+| Batch 5 Verification Suite | `npm run batch5:test` | ✅ PASS | 142/142 assertions passed across all 21 test sections |
+| Batch 4 Regression Suite | `npm run batch4:test` | ✅ PASS | 51/51 assertions passed across all 10 scenarios |
+| Batch 3 Regression Suite | `npm run batch3:test` | ✅ PASS | 96/96 assertions passed across all 14 scenarios |
+| Batch 2 Regression Suite | `npm run batch2:test` | ✅ PASS | 25/25 assertions passed across all 9 outbox/persistence scenarios |
+| Batch 1 Regression Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
+| TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
+| Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched |

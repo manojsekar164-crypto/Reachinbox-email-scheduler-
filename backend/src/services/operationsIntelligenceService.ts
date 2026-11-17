@@ -36,6 +36,7 @@ import {
   SenderPerformanceIntelligenceResult,
   SenderPerformanceMetric,
   QueueIntelligenceResult,
+  QueueIntelligenceOptions,
   QueueJobCounts,
   OperationalBottleneck,
   OperationalBottleneckAnalysisResult,
@@ -260,7 +261,18 @@ export async function getDeliveryFailureIntelligence(
   const totalFailed = parseInt(totalsRes.rows[0]?.total_failed || '0', 10);
   const totalUnknown = parseInt(totalsRes.rows[0]?.total_unknown || '0', 10);
 
-  // 2. Error classifications from latest attempt records of failed, unknown, or retrying deliveries
+  // 2. Total actual attempts across all user dispatches
+  const attemptsRes = await dbPool.query<{ total_attempts: string }>(
+    `SELECT COUNT(ea.id)::int AS total_attempts
+     FROM email_attempts ea
+     JOIN email_deliveries ed ON ed.id = ea.delivery_id
+     JOIN campaigns c ON c.id = ed.campaign_id
+     WHERE c.user_id = $1;`,
+    [userId]
+  );
+  const totalAttempts = parseInt(attemptsRes.rows[0]?.total_attempts || '0', 10);
+
+  // 3. Error classifications from latest attempt records of failed, unknown, or retrying deliveries
   const classRes = await dbPool.query<{ classification: string; count: string }>(
     `SELECT
        COALESCE(ea.error_classification, 'unclassified') AS classification,
@@ -280,13 +292,11 @@ export async function getDeliveryFailureIntelligence(
   let transientCount = 0;
   let permanentCount = 0;
   let uncertainCount = 0;
-  let totalAttempts = 0;
 
   for (const row of classRes.rows) {
     const cnt = parseInt(row.count, 10);
     const cls = row.classification;
     errorClassifications[cls] = cnt;
-    totalAttempts += cnt;
 
     if (
       cls === 'transient_rejection' ||
@@ -475,7 +485,7 @@ export async function getSenderPerformanceIntelligence(
        SELECT
          ea.sender_id,
          COUNT(ea.id)::int AS total_attempts,
-         COUNT(CASE WHEN ea.status = 'sent' THEN 1 END)::int AS confirmed_smtp_acceptances,
+         COUNT(CASE WHEN ea.status = 'sent' AND (ea.smtp_response_code IS NOT NULL OR ea.smtp_message_id IS NOT NULL) THEN 1 END)::int AS confirmed_smtp_acceptances,
          COUNT(CASE WHEN ea.status = 'failed' THEN 1 END)::int AS confirmed_failures,
          COUNT(CASE WHEN ea.status = 'unknown' THEN 1 END)::int AS unknown_outcomes
        FROM email_attempts ea
@@ -494,9 +504,9 @@ export async function getSenderPerformanceIntelligence(
        COALESCE(ds.failed_deliveries, 0) AS failed_deliveries,
        COALESCE(ds.unknown_deliveries, 0) AS unknown_deliveries,
        COALESCE(att.total_attempts, 0) AS total_attempts,
-       COALESCE(ds.sent_deliveries, 0) AS confirmed_smtp_acceptances,
-       COALESCE(ds.failed_deliveries, 0) AS confirmed_failures,
-       COALESCE(ds.unknown_deliveries, 0) AS unknown_outcomes
+       COALESCE(att.confirmed_smtp_acceptances, 0) AS confirmed_smtp_acceptances,
+       COALESCE(att.confirmed_failures, 0) AS confirmed_failures,
+       COALESCE(att.unknown_outcomes, 0) AS unknown_outcomes
      FROM senders s
      LEFT JOIN delivery_stats ds ON ds.sender_id = s.id
      LEFT JOIN attempt_stats att ON att.sender_id = s.id
@@ -601,13 +611,17 @@ export async function getSenderPerformanceIntelligence(
  * Scopes job inspection strictly to the authenticated user's campaigns.
  * Gracefully handles Redis unavailability and flags unavailable queue data.
  */
+const DEFAULT_SAMPLE_LIMIT = 2500;
+
 export async function getQueueIntelligence(
   userId: string,
   queue: Queue<EmailJobPayload> = defaultQueue,
   dbPool: Pool | PoolClient = defaultPool,
-  redisClient: Redis = defaultRedis
+  redisClient: Redis = defaultRedis,
+  options?: QueueIntelligenceOptions
 ): Promise<QueueIntelligenceResult> {
   const queueName = queue?.name || 'email-queue';
+  const sampleLimit = options?.sampleLimit || DEFAULT_SAMPLE_LIMIT;
 
   try {
     // 1. Verify Redis connectivity with a quick bounded ping
@@ -616,77 +630,126 @@ export async function getQueueIntelligence(
         queue_name: queueName,
         is_available: false,
         unavailable_reason: 'Redis client not configured or unavailable',
+        user_backlog: null,
+        user_counts: null,
+        count_scope: 'tenant_scoped',
+        is_partial: false,
+        sample_limit: sampleLimit,
         queue_backlog: null,
-        global_counts: null,
         user_scoped_counts: null,
+        global_counts: null,
       };
     }
 
     await redisClient.ping();
 
-    // 2. Retrieve global queue counts
-    const globalJobCounts = await queue.getJobCounts('waiting', 'active', 'delayed', 'failed');
-    const globalCounts: QueueJobCounts = {
-      waiting: globalJobCounts.waiting || 0,
-      active: globalJobCounts.active || 0,
-      delayed: globalJobCounts.delayed || 0,
-      failed: globalJobCounts.failed || 0,
-    };
-    const backlog = globalCounts.waiting + globalCounts.active + globalCounts.delayed;
-
-    // 3. User-scoped queue inspection
-    // Lookup user's campaign IDs to isolate jobs
+    // 2. Query user's campaign IDs to isolate jobs
     const campRes = await dbPool.query<{ id: string }>(
       `SELECT id FROM campaigns WHERE user_id = $1;`,
       [userId]
     );
     const userCampaignIds = new Set(campRes.rows.map((r) => r.id));
 
-    let userScopedCounts: QueueJobCounts | null = {
-      waiting: 0,
-      active: 0,
-      delayed: 0,
-      failed: 0,
+    // If user has no campaigns, they have 0 jobs
+    if (userCampaignIds.size === 0) {
+      const zeroCounts: QueueJobCounts = { waiting: 0, active: 0, delayed: 0, failed: 0 };
+      return {
+        queue_name: queueName,
+        is_available: true,
+        user_backlog: 0,
+        user_counts: zeroCounts,
+        count_scope: 'tenant_scoped',
+        is_partial: false,
+        sample_limit: sampleLimit,
+        queue_backlog: 0,
+        user_scoped_counts: zeroCounts,
+        global_counts: null,
+      };
+    }
+
+    // 3. Inspect queue job counts across states to check queue depth
+    const jobCounts = await queue.getJobCounts('waiting', 'active', 'delayed', 'failed');
+    const waitingTotal = jobCounts.waiting || 0;
+    const activeTotal = jobCounts.active || 0;
+    const delayedTotal = jobCounts.delayed || 0;
+    const failedTotal = jobCounts.failed || 0;
+
+    // Helper to fetch jobs in chunks up to sampleLimit, accurately handling > 500 jobs
+    async function scanStateJobs(
+      fetcher: (start: number, end: number) => Promise<any[]>,
+      totalInState: number
+    ): Promise<{ matchingJobsCount: number; isPartial: boolean }> {
+      let matchCount = 0;
+      let fetched = 0;
+      const batchSize = 500;
+      const toFetch = Math.min(totalInState, sampleLimit);
+
+      while (fetched < toFetch) {
+        const start = fetched;
+        const end = Math.min(start + batchSize - 1, toFetch - 1);
+        const batch = await fetcher(start, end);
+        if (!batch || batch.length === 0) break;
+
+        for (const job of batch) {
+          if (job?.data?.campaignId && userCampaignIds.has(job.data.campaignId)) {
+            matchCount++;
+          }
+        }
+
+        fetched += batch.length;
+        if (batch.length < (end - start + 1)) break;
+      }
+
+      return {
+        matchingJobsCount: matchCount,
+        isPartial: totalInState > sampleLimit,
+      };
+    }
+
+    const [waitingRes, activeRes, delayedRes, failedRes] = await Promise.all([
+      scanStateJobs((s, e) => queue.getWaiting(s, e), waitingTotal),
+      scanStateJobs((s, e) => queue.getActive(s, e), activeTotal),
+      scanStateJobs((s, e) => queue.getDelayed(s, e), delayedTotal),
+      scanStateJobs((s, e) => queue.getFailed(s, e), failedTotal),
+    ]);
+
+    const userCounts: QueueJobCounts = {
+      waiting: waitingRes.matchingJobsCount,
+      active: activeRes.matchingJobsCount,
+      delayed: delayedRes.matchingJobsCount,
+      failed: failedRes.matchingJobsCount,
     };
 
-    if (userCampaignIds.size > 0 && backlog > 0) {
-      // Bounded retrieval of jobs across queues to map user campaign ownership
-      const [waitingJobs, activeJobs, delayedJobs, failedJobs] = await Promise.all([
-        queue.getWaiting(0, 500),
-        queue.getActive(0, 500),
-        queue.getDelayed(0, 500),
-        queue.getFailed(0, 500),
-      ]);
+    const isPartial =
+      waitingRes.isPartial || activeRes.isPartial || delayedRes.isPartial || failedRes.isPartial;
 
-      userScopedCounts.waiting = waitingJobs.filter((j) =>
-        userCampaignIds.has(j.data?.campaignId)
-      ).length;
-      userScopedCounts.active = activeJobs.filter((j) =>
-        userCampaignIds.has(j.data?.campaignId)
-      ).length;
-      userScopedCounts.delayed = delayedJobs.filter((j) =>
-        userCampaignIds.has(j.data?.campaignId)
-      ).length;
-      userScopedCounts.failed = failedJobs.filter((j) =>
-        userCampaignIds.has(j.data?.campaignId)
-      ).length;
-    }
+    const userBacklog = userCounts.waiting + userCounts.active + userCounts.delayed;
 
     return {
       queue_name: queueName,
       is_available: true,
-      queue_backlog: backlog,
-      global_counts: globalCounts,
-      user_scoped_counts: userScopedCounts,
+      user_backlog: userBacklog,
+      user_counts: userCounts,
+      count_scope: 'tenant_scoped',
+      is_partial: isPartial,
+      sample_limit: sampleLimit,
+      queue_backlog: userBacklog,
+      user_scoped_counts: userCounts,
+      global_counts: null,
     };
   } catch (err: any) {
     return {
       queue_name: queueName,
       is_available: false,
       unavailable_reason: `Redis/BullMQ queue unavailable: ${err.message || 'connection error'}`,
+      user_backlog: null,
+      user_counts: null,
+      count_scope: 'tenant_scoped',
+      is_partial: false,
+      sample_limit: sampleLimit,
       queue_backlog: null,
-      global_counts: null,
       user_scoped_counts: null,
+      global_counts: null,
     };
   }
 }
@@ -1064,10 +1127,17 @@ export async function getOperationsContext(
     })),
     queue_summary: {
       available: queueIntel.is_available,
-      backlog: queueIntel.queue_backlog,
-      global_counts: queueIntel.global_counts,
-      user_scoped_counts: queueIntel.user_scoped_counts,
-      notes: queueIntel.unavailable_reason || undefined,
+      backlog: queueIntel.user_backlog,
+      counts: queueIntel.user_counts,
+      count_scope: queueIntel.count_scope,
+      is_partial: queueIntel.is_partial,
+      sample_limit: queueIntel.sample_limit,
+      user_scoped_counts: queueIntel.user_counts,
+      notes:
+        queueIntel.unavailable_reason ||
+        (queueIntel.is_partial
+          ? `Queue depth exceeds sample limit of ${queueIntel.sample_limit}. Counts may be partial.`
+          : undefined),
     },
     bottlenecks: bottleneckIntel.bottlenecks.map((b) => ({
       type: b.bottleneck_type,

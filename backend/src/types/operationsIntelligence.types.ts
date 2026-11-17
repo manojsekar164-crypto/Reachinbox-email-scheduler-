@@ -127,13 +127,23 @@ export interface QueueJobCounts {
   failed: number;
 }
 
+export interface QueueIntelligenceOptions {
+  sampleLimit?: number;
+}
+
 export interface QueueIntelligenceResult {
   queue_name: string;
   is_available: boolean;
   unavailable_reason?: string | null;
-  queue_backlog: number | null;
-  global_counts: QueueJobCounts | null;
-  user_scoped_counts: QueueJobCounts | null;
+  user_backlog: number | null;
+  user_counts: QueueJobCounts | null;
+  count_scope: 'tenant_scoped';
+  is_partial: boolean;
+  sample_limit: number;
+  // Compatibility aliases
+  queue_backlog?: number | null;
+  user_scoped_counts?: QueueJobCounts | null;
+  global_counts?: null;
 }
 
 export type BottleneckSeverity = 'info' | 'warning' | 'critical';
@@ -204,8 +214,11 @@ export interface OperationsContext {
   queue_summary: {
     available: boolean;
     backlog: number | null;
-    global_counts: QueueJobCounts | null;
-    user_scoped_counts: QueueJobCounts | null;
+    counts: QueueJobCounts | null;
+    count_scope: 'tenant_scoped';
+    is_partial: boolean;
+    sample_limit: number;
+    user_scoped_counts?: QueueJobCounts | null;
     notes?: string;
   };
   bottlenecks: Array<{

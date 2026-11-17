@@ -455,12 +455,13 @@ async function runBatch7AVerification(): Promise<void> {
 
       const s1 = senderIntel.senders.find((s) => s.sender_id === senderA1Id);
       assert(s1 !== undefined, 'Sender A1 primary exists in output');
-      assert(s1?.unique_deliveries === 9, 'Sender A1 unique deliveries = 9');
-      assert(s1?.confirmed_smtp_acceptances === 3, 'Sender A1 confirmed SMTP acceptances = 3');
-      assert(s1?.confirmed_failures === 3, 'Sender A1 confirmed failures = 3');
-      assert(s1?.unknown_outcomes === 1, 'Sender A1 unknown outcomes = 1');
+      assert(s1?.unique_deliveries === 9, 'Sender A1 unique deliveries = 9 (distinct recipient targets)');
+      assert(s1?.total_attempts === 12, 'Sender A1 total attempts = 12 (actual attempt records across dispatches)');
+      assert(s1?.confirmed_smtp_acceptances === 3, 'Sender A1 confirmed SMTP acceptances = 3 (actual sent attempt records)');
+      assert(s1?.confirmed_failures === 8, 'Sender A1 confirmed failures = 8 (actual failed attempt records)');
+      assert(s1?.unknown_outcomes === 1, 'Sender A1 unknown outcomes = 1 (actual unknown attempt records)');
       assert(s1?.hourly_limit === 100, 'Sender A1 hourly limit = 100');
-      assert(s1?.health_status === 'critical', 'Sender A1 health status is critical due to 50% failure rate');
+      assert(s1?.health_status === 'critical', 'Sender A1 health status is critical due to 72.7% failure rate');
 
       const s2 = senderIntel.senders.find((s) => s.sender_id === senderA2Id);
       assert(s2 !== undefined, 'Sender A2 backup exists in output');
@@ -468,6 +469,40 @@ async function runBatch7AVerification(): Promise<void> {
       assert(s2?.total_attempts === 0, 'Sender A2 total attempts = 0');
       assert(s2?.health_status === 'idle', 'Sender A2 health status is idle (0 attempts)');
       assert(s2?.success_rate === null, 'Sender A2 success rate is null (not 0 or fake score)');
+
+      // ---------------------------------------------------------------------
+      // TEST 3B: Operator-Confirmed Acceptance Without SMTP Evidence
+      // ---------------------------------------------------------------------
+      console.log('\n' + SUB_SEP);
+      console.log('TEST 3B: Operator-Confirmed Acceptance Without SMTP Evidence');
+      console.log(SUB_SEP);
+
+      // Create an unknown delivery on Sender A2 with attempt_status = 'unknown' and NO SMTP evidence
+      const opDel = await createTestDelivery(
+        campA3Id,
+        senderA2Id,
+        'operator_resolved@reachinbox.test',
+        'Operator Resolved',
+        'unknown',
+        1,
+        'Simulated timeout',
+        'ambiguous_outcome',
+        null
+      );
+      // Simulate operator resolving delivery to 'sent'
+      await testClient.query(
+        `UPDATE email_deliveries SET status = 'sent', last_error = 'Resolved by operator: confirmed_accepted' WHERE id = $1;`,
+        [opDel.deliveryId]
+      );
+      // Re-query sender performance
+      const senderIntelAfterOp = await getSenderPerformanceIntelligence(userAId, testPool);
+      const s2After = senderIntelAfterOp.senders.find((s) => s.sender_id === senderA2Id);
+      assert(s2After?.unique_deliveries === 1, 'Sender A2 reports 1 unique delivery after operator resolution');
+      assert(
+        s2After?.confirmed_smtp_acceptances === 0,
+        'Operator-confirmed acceptance without SMTP evidence is NOT counted as verified SMTP acceptance'
+      );
+      assert(s2After?.unknown_outcomes === 1, 'Unknown attempt remains recorded as unknown outcome');
 
       // ---------------------------------------------------------------------
       // TEST 4: SMTP Acceptance versus Inbox Delivery Distinction
@@ -497,6 +532,7 @@ async function runBatch7AVerification(): Promise<void> {
       const failIntel = await getDeliveryFailureIntelligence(userAId, {}, testPool);
       assert(failIntel.total_failed_deliveries === 3, 'Reports 3 total failed deliveries');
       assert(failIntel.total_unknown_deliveries === 1, 'Reports 1 total unknown delivery');
+      assert(failIntel.total_attempts === 13, 'Failure intelligence reports actual attempt records (13 total attempts)');
 
       // Classification breakdown
       assert(failIntel.error_classifications['permanent_rejection'] === 2, 'Classifies 2 permanent rejections');
@@ -556,9 +592,9 @@ async function runBatch7AVerification(): Promise<void> {
       const queueIntelA = await getQueueIntelligence(userAId, emailQueue, testPool, redis);
       assert(queueIntelA.is_available === true, 'Queue is reported as available');
       assert(queueIntelA.queue_name === 'email-queue', 'Queue name matches email-queue');
-      assert(queueIntelA.global_counts !== null, 'Global queue counts returned');
-      assert(queueIntelA.global_counts!.waiting >= 2, 'Global waiting jobs includes both tenant jobs');
-      assert(queueIntelA.global_counts!.delayed >= 1, 'Global delayed jobs reflects delayed job');
+      assert(queueIntelA.global_counts === null, 'Global queue counts are strictly NULL (never exposed to ordinary users)');
+      assert(queueIntelA.count_scope === 'tenant_scoped', 'Count scope is explicitly tenant_scoped');
+      assert(queueIntelA.user_backlog === 2, 'User A backlog is strictly 2 (1 waiting + 1 delayed)');
 
       // ---------------------------------------------------------------------
       // TEST 7: Campaign-Level Queue Isolation (Multi-Tenant Scoping)
@@ -567,25 +603,79 @@ async function runBatch7AVerification(): Promise<void> {
       console.log('TEST 7: Campaign-Level Queue Isolation (Multi-Tenant Scoping)');
       console.log(SUB_SEP);
 
-      assert(queueIntelA.user_scoped_counts !== null, 'User-scoped queue counts are populated');
+      assert(queueIntelA.user_counts !== null, 'User-scoped queue counts are populated');
       assert(
-        queueIntelA.user_scoped_counts!.waiting === 1,
+        queueIntelA.user_counts!.waiting === 1,
         'User A user-scoped waiting count is strictly 1 (User B job excluded)'
       );
       assert(
-        queueIntelA.user_scoped_counts!.delayed === 1,
+        queueIntelA.user_counts!.delayed === 1,
         'User A user-scoped delayed count is strictly 1'
       );
 
       // User B query
       const queueIntelB = await getQueueIntelligence(userBId, emailQueue, testPool, redis);
       assert(
-        queueIntelB.user_scoped_counts!.waiting === 1,
+        queueIntelB.user_counts!.waiting === 1,
         'User B user-scoped waiting count is strictly 1 (User A job excluded)'
       );
       assert(
-        queueIntelB.user_scoped_counts!.delayed === 0,
+        queueIntelB.user_counts!.delayed === 0,
         'User B user-scoped delayed count is strictly 0 (User A delayed job excluded)'
+      );
+
+      // ---------------------------------------------------------------------
+      // TEST 7B: Queue Depth > 500 Jobs and Explicit Partial Sampling
+      // ---------------------------------------------------------------------
+      console.log('\n' + SUB_SEP);
+      console.log('TEST 7B: Queue Depth > 500 Jobs and Explicit Partial Sampling');
+      console.log(SUB_SEP);
+
+      // Add 600 jobs for User A
+      const bulkJobs = [];
+      for (let i = 0; i < 600; i++) {
+        bulkJobs.push({
+          name: `bulk_job_${i}`,
+          data: {
+            campaignId: campA1Id,
+            recipientId: `r_bulk_${i}`,
+          },
+        });
+      }
+      await emailQueue.addBulk(bulkJobs);
+
+      // Complete pagination scan (> 500 jobs)
+      const queueIntelLarge = await getQueueIntelligence(
+        userAId,
+        emailQueue,
+        testPool,
+        redis,
+        { sampleLimit: 2500 }
+      );
+      assert(
+        queueIntelLarge.user_counts!.waiting === 601,
+        'Handles > 500 queue jobs accurately via chunked scanning (601 waiting jobs)'
+      );
+      assert(
+        queueIntelLarge.is_partial === false,
+        'is_partial is false when total queue is within sampleLimit'
+      );
+
+      // Bounded partial scan (sampleLimit = 300)
+      const queueIntelPartial = await getQueueIntelligence(
+        userAId,
+        emailQueue,
+        testPool,
+        redis,
+        { sampleLimit: 300 }
+      );
+      assert(
+        queueIntelPartial.is_partial === true,
+        'Explicitly marks is_partial = true when queue exceeds sampleLimit'
+      );
+      assert(
+        queueIntelPartial.sample_limit === 300,
+        'Reports configured sample_limit'
       );
 
       // ---------------------------------------------------------------------
@@ -724,6 +814,20 @@ async function runBatch7AVerification(): Promise<void> {
       assert(!contextJson.includes('sent1@reachinbox.test'), 'Zero recipient email addresses leaked in context');
       assert(!contextJson.includes('Private B'), 'Zero tenant B names leaked in context');
       assert(!contextJson.includes('Content Body A1'), 'Zero email bodies leaked in context');
+
+      // Verify queue tenant isolation in operations context
+      assert(
+        (opsContext.queue_summary as any).global_counts === undefined,
+        'Zero cross-tenant global queue counts exposed in operations context'
+      );
+      assert(
+        opsContext.queue_summary.count_scope === 'tenant_scoped',
+        'Queue summary scope is explicitly tenant_scoped'
+      );
+      assert(
+        opsContext.queue_summary.backlog !== null,
+        'Queue summary backlog is tenant-scoped'
+      );
 
       // Verify bottleneck detection in context
       assert(opsContext.bottlenecks.length > 0, 'Bottleneck analysis detected operational bottlenecks');
