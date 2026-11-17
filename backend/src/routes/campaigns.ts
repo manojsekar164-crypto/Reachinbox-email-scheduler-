@@ -17,6 +17,12 @@ import {
   listRecipients,
 } from '../controllers/campaignController';
 import { preflightCampaignHandler } from '../controllers/preflightController';
+import {
+  pauseCampaignHandler,
+  resumeCampaignHandler,
+  cancelCampaignHandler,
+  listCampaignDeliveriesHandler,
+} from '../controllers/recoveryController';
 
 const router = Router();
 
@@ -27,6 +33,11 @@ router.use(requireAuth);
 router.post('/preflight', preflightCampaignHandler);
 router.post('/:id/preflight', preflightCampaignHandler);
 
+// ─── Campaign Lifecycle Controls ─────────────────────────────────────────────
+router.post('/:id/pause', pauseCampaignHandler);
+router.post('/:id/resume', resumeCampaignHandler);
+router.post('/:id/cancel', cancelCampaignHandler);
+
 // ─── Campaign CRUD ────────────────────────────────────────────────────────────
 router.post('/', createCampaign);
 router.get('/', listCampaigns);
@@ -34,7 +45,8 @@ router.get('/:id', getCampaign);
 router.patch('/:id', patchCampaign);
 router.delete('/:id', removeCampaign);
 
-// ─── Recipients ───────────────────────────────────────────────────────────────
+// ─── Recipients & Deliveries ──────────────────────────────────────────────────
 router.get('/:id/recipients', listRecipients);
+router.get('/:id/deliveries', listCampaignDeliveriesHandler);
 
 export default router;

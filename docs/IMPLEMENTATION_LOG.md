@@ -795,3 +795,71 @@ Awaiting explicit operator authorization.
 | Batch 1 Regression Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
 | TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
 | Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched |
+
+---
+
+## [Entry 015] - 2026-11-17 - Phase 1 Batch 6: Email Failure & Recovery Center (Backend Only)
+
+**Scope:** Batch 6 – Failure Monitoring, Attempt History, Safe Manual Retry, Unknown Delivery Resolution & Campaign Lifecycle
+**Branch:** `feat/database-foundation`
+**Starting Baseline Commit:** `e428c9b`
+**Engineer:** Senior Backend Engineer
+
+### Implementation Summary
+
+1. **Failure Monitoring & Attempt History (`src/services/recoveryService.ts`, `src/controllers/recoveryController.ts`, `src/routes/deliveries.ts`):**
+   - Implemented authenticated REST endpoints:
+     - `GET /deliveries` (multi-criteria filtering by status, campaign, sender, error classification, date range; pagination with limit/offset/page; stable sorting).
+     - `GET /deliveries/failed` (convenience view for failed deliveries).
+     - `GET /deliveries/unknown` (convenience view for ambiguous/uncertain deliveries requiring operator review).
+     - `GET /deliveries/:id` (individual delivery details with attempt history, resolutions, and retry eligibility).
+     - `GET /deliveries/:id/attempts` (complete immutable attempt audit history).
+     - `GET /campaigns/:id/deliveries` (campaign-scoped delivery listing).
+   - Strict multi-tenant security: every query joins `campaigns c ON c.id = ed.campaign_id WHERE c.user_id = $1`. Cross-tenant delivery access is rejected with HTTP 404/403.
+   - Sensitive credential protection: sender credential columns (`smtp_pass`, `smtp_user`) are strictly excluded from queries.
+
+2. **Retry Eligibility Engine (`evaluateRetryEligibility`):**
+   - Transparently evaluates and displays retry eligibility and reasons:
+     - `transient_rejection` and `connection_failure`: eligible.
+     - `operator_confirmed_not_accepted`: eligible.
+     - `permanent_rejection`: ineligible (hard bounce, invalid mailbox, auth failure).
+     - `ambiguous_outcome` / `stale_claim_reconciliation` (`unknown`): ineligible without operator resolution.
+     - `sent`, `cancelled`, and `in-flight`: strictly ineligible.
+     - Enforces policy attempt limits (`attempt_count >= maxAttempts` -> ineligible).
+
+3. **Safe Manual Retry (`manualRetryDelivery`):**
+   - Atomic state transition via PostgreSQL `FOR UPDATE OF ed`.
+   - Validates failure classification and eligibility rules.
+   - Prevents duplicate manual retry requests: verifies no active outbox record is in progress and uses deterministic deduplication key `retry_${delivery.id}_attempt_${nextAttemptNumber}` with `ON CONFLICT (deduplication_key) DO NOTHING`.
+   - Disallows retrying sent, cancelled, or unknown deliveries.
+   - Publishes outbox event immediately via `outboxPublisher`.
+
+4. **Unknown Delivery Review & Resolution (`resolveUnknownDelivery`, `008_create_operator_resolutions_schema.sql`):**
+   - Created forward-only migration `008_create_operator_resolutions_schema.sql` adding `delivery_resolutions` audit table.
+   - Supported decisions:
+     - `confirmed_accepted`: reconciles delivery and attempt to `sent` without fabricating SMTP metadata (codes and message IDs left as NULL).
+     - `confirmed_not_accepted`: transitions delivery to `failed` with classification `operator_confirmed_not_accepted`, making it eligible for manual retry while never automatically retrying.
+   - Requires mandatory non-empty reason and verified campaign ownership.
+   - Persists immutable audit record in `delivery_resolutions`.
+
+5. **Campaign Lifecycle Controls (`pauseCampaign`, `resumeCampaign`, `cancelCampaign`):**
+   - `POST /campaigns/:id/pause`: atomically sets campaign to `paused`. Prevents new delivery claims (since `claimDelivery` checks `c.status = 'sending'`). Reports in-flight dispatches completing.
+   - `POST /campaigns/:id/resume`: transitions paused campaign to `sending` (or `scheduled`). Republishes only eligible outstanding deliveries (`pending`, `scheduled`, `retry_wait`) through outbox. Strictly excludes `sent`, `unknown`, `failed`, `cancelled`.
+   - `POST /campaigns/:id/cancel`: transitions campaign to `cancelled`. Atomically cancels outstanding deliveries and outbox records. Strictly preserves `sent` and `unknown` deliveries.
+   - All lifecycle endpoints are idempotent across repeated calls.
+
+6. **Batch 6 Acceptance Tests (`src/scripts/testBatch6Recovery.ts`):**
+   - 12 comprehensive scenarios verifying cross-tenant isolation, failure listing/pagination, attempt history preservation, retry eligibility, concurrent retry deduplication, sent/unknown retry refusal, operator resolution without metadata fabrication, mandatory reason audit, pause claim prevention, resume safe republication, cancel protection, and production DB untouched.
+
+### Actual Test Results
+
+| Test Suite | Command | Result | Notes |
+|---|---|---|---|
+| Batch 6 Verification Suite | `npm run batch6:test` | ✅ PASS | 75/75 assertions passed across all 12 scenarios |
+| Batch 5 Verification Suite | `npm run batch5:test` | ✅ PASS | 142/142 assertions passed across all 21 test sections |
+| Batch 4 Regression Suite | `npm run batch4:test` | ✅ PASS | 51/51 assertions passed across all 10 scenarios |
+| Batch 3 Regression Suite | `npm run batch3:test` | ✅ PASS | 96/96 assertions passed across all 14 scenarios |
+| Batch 2 Regression Suite | `npm run batch2:test` | ✅ PASS | 25/25 assertions passed across all 9 outbox/persistence scenarios |
+| Batch 1 Regression Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
+| TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
+| Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched |
