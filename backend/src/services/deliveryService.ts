@@ -254,24 +254,26 @@ export async function recordAttemptStart(
  */
 export async function recordAttemptSuccess(
   deliveryId: string,
-  attemptId: string,
+  attemptId: string | null,
   smtpMessageId: string | null,
   client: Pool | PoolClient = defaultPool,
-  smtpResponseCode: string | null = '250'
+  smtpResponseCode: string | null = null
 ): Promise<void> {
-  const code = smtpResponseCode || '250';
+  const code = smtpResponseCode || null;
 
   // Update attempt history
-  await client.query(
-    `UPDATE email_attempts
-     SET status = 'sent',
-         smtp_message_id = $1,
-         smtp_response_code = $2,
-         error_classification = 'confirmed_acceptance',
-         completed_at = NOW()
-     WHERE id = $3`,
-    [smtpMessageId, code, attemptId]
-  );
+  if (attemptId) {
+    await client.query(
+      `UPDATE email_attempts
+       SET status = 'sent',
+           smtp_message_id = $1,
+           smtp_response_code = $2,
+           error_classification = 'confirmed_acceptance',
+           completed_at = NOW()
+       WHERE id = $3`,
+      [smtpMessageId, code, attemptId]
+    );
+  }
 
   // Update canonical delivery
   await client.query(
@@ -287,6 +289,65 @@ export async function recordAttemptSuccess(
      WHERE id = $2`,
     [smtpMessageId, deliveryId]
   );
+}
+
+/**
+ * Records a database persistence failure occurring AFTER confirmed SMTP acceptance.
+ * Invariant: Preserves the attempt record with genuine SMTP messageId, sets delivery to 'unknown'
+ * (reconciliation required), clears lease and claim ownership, and ensures the delivery is NEVER
+ * automatically retried or resent.
+ */
+export async function recordPostgresPersistenceFailure(
+  deliveryId: string,
+  attemptId: string | null,
+  smtpMessageId: string | null,
+  smtpResponseCode: string | null,
+  dbErrorMessage: string,
+  client: Pool | PoolClient = defaultPool
+): Promise<void> {
+  const code = smtpResponseCode || null;
+  const desc = `PostgreSQL persistence failure after confirmed SMTP acceptance: ${dbErrorMessage}`;
+
+  const tryUpdate = async (runner: Pool | PoolClient) => {
+    if (attemptId) {
+      await runner.query(
+        `UPDATE email_attempts
+         SET status = 'unknown',
+             smtp_message_id = COALESCE($1, smtp_message_id),
+             smtp_response_code = $2,
+             error_classification = 'persistence_failure_after_acceptance',
+             error_message = $3,
+             completed_at = NOW()
+         WHERE id = $4`,
+        [smtpMessageId, code, desc, attemptId]
+      );
+    }
+
+    await runner.query(
+      `UPDATE email_deliveries
+       SET status = 'unknown',
+           smtp_message_id = COALESCE($1, smtp_message_id),
+           last_error = $2,
+           claim_owner = NULL,
+           lease_expires_at = NULL,
+           next_attempt_at = NULL,
+           updated_at = NOW()
+       WHERE id = $3`,
+      [smtpMessageId, desc, deliveryId]
+    );
+  };
+
+  try {
+    await tryUpdate(client);
+  } catch (err: any) {
+    if (client !== defaultPool) {
+      try {
+        await tryUpdate(defaultPool);
+      } catch (poolErr: any) {
+        console.error(`💥 [Delivery ${deliveryId}] Failed to record persistence failure state:`, poolErr.message);
+      }
+    }
+  }
 }
 
 /**

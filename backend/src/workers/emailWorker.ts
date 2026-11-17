@@ -1,6 +1,6 @@
 import { Worker, Job, DelayedError } from 'bullmq';
 import { emailQueueName, EmailJobPayload, redisConnectionOptions } from '../queue/emailQueue';
-import { sendEmail } from '../services/emailService';
+import { sendEmail, SendEmailResult } from '../services/emailService';
 import { checkRateLimit, checkSenderRateLimit } from '../services/rateLimiter';
 import { handleRateLimitNotification, notifyCampaignCompleted } from '../services/slackService';
 import { indexEmailAsSent } from '../services/searchService';
@@ -20,6 +20,7 @@ import {
   recordAttemptTransientRejection,
   recordAttemptConnectionFailure,
   recordAttemptAmbiguousOutcome,
+  recordPostgresPersistenceFailure,
   classifySmtpOutcome,
   isUncertainSmtpError,
   activateDueCampaign,
@@ -53,6 +54,8 @@ export async function processEmailJob(
     data: EmailJobPayload & {
       simulateFailure?: boolean;
       simulateUncertain?: boolean;
+      simulateDbFailureAfterSend?: boolean;
+      simulateNoResponseCode?: boolean;
       testWindowSeconds?: number;
     };
     attemptsMade: number;
@@ -62,7 +65,15 @@ export async function processEmailJob(
   },
   dbClient = pool
 ): Promise<void> {
-  const { campaignId, recipientId, simulateFailure, simulateUncertain, testWindowSeconds } = job.data;
+  const {
+    campaignId,
+    recipientId,
+    simulateFailure,
+    simulateUncertain,
+    simulateDbFailureAfterSend,
+    simulateNoResponseCode,
+    testWindowSeconds,
+  } = job.data;
   const attempt = job.attemptsMade + 1;
   const jobId = job.id || `direct_${Date.now()}`;
 
@@ -265,7 +276,10 @@ export async function processEmailJob(
     dbClient
   );
 
-  // --- 6. Send Email via Nodemailer ---
+  // --- 6. Send Email via Nodemailer (Isolated SMTP Error Boundary) ---
+  let sendResult: SendEmailResult | null = null;
+  let smtpConfirmed = false;
+
   try {
     // Simulated Intentional Failure for Testing Retries
     if (simulateFailure && attempt === 1 && config.app.nodeEnv !== 'production') {
@@ -283,68 +297,20 @@ export async function processEmailJob(
     }
 
     console.log(`   ✉️ [Job ${jobId}] Sending email via Nodemailer...`);
-    const result = await sendEmail({
+    sendResult = await sendEmail({
       sender: sender || undefined,
       to: recipient.email,
       subject,
       text: bodyText,
       html: bodyHtml,
     });
-
-    // Extract genuine server message ID from SMTP response (e.g. queued as <...>) or client Message-ID
-    const queuedAsMatch = result.response ? result.response.match(/queued as\s+(<[^>\s]+>|[^\s]+)/i) : null;
-    const genuineMessageId = queuedAsMatch ? queuedAsMatch[1] : result.messageId;
-
-    console.log(`   ✅ [Job ${jobId}] Email accepted by SMTP server! MessageId: ${genuineMessageId}`);
-
-    // Update canonical delivery and attempt to 'sent' with genuine messageId and response code
-    const responseCode = result.response ? (result.response.match(/\b([245]\d{2})\b/)?.[1] || '250') : '250';
-    await recordAttemptSuccess(claimedDelivery.id, attemptId, genuineMessageId, dbClient, responseCode);
-
-    // Record Success in historical email_logs
-    await dbClient.query(
-      `INSERT INTO email_logs (campaign_id, recipient_id, sender_id, status, error_message, sent_at)
-       VALUES ($1, $2, $3, 'sent', NULL, NOW())`,
-      [campaignId, recipientId, campaign.sender_id || null]
-    );
-
-    // Index in Elasticsearch (safely in background)
-    if (process.env.DISABLE_ES_INDEXING !== 'true') {
-      try {
-        await indexEmailAsSent(campaign, recipient, new Date());
-      } catch (esErr: any) {
-        console.error(`❌ [Elasticsearch] Sent email indexing failed: ${esErr.message}`);
-      }
-    }
-
-    // Check campaign completion status
-    try {
-      const remainingCheck = await dbClient.query(
-        `SELECT COUNT(*) as remaining FROM email_deliveries ed
-         WHERE ed.campaign_id = $1
-           AND ed.deleted_at IS NULL
-           AND ed.status != 'sent'`,
-        [campaignId]
-      );
-      const remaining = parseInt(remainingCheck.rows[0]?.remaining || '1', 10);
-      if (remaining === 0) {
-        await dbClient.query("UPDATE campaigns SET status = 'completed', updated_at = NOW() WHERE id = $1", [
-          campaignId,
-        ]);
-        console.log(`🎉 [Campaign ${campaignId}] All recipients processed. Campaign marked completed.`);
-
-        try {
-          await notifyCampaignCompleted(campaign.user_id, campaignId, campaign.subject);
-        } catch (slackErr: any) {
-          console.warn(`⚠️ [Slack] Failed to send completion notification: ${slackErr.message}`);
-        }
-      }
-    } catch (statusErr: any) {
-      console.warn(`⚠️ [Campaign ${campaignId}] Could not update status: ${statusErr.message}`);
-    }
-  } catch (error: any) {
-    const classification = classifySmtpOutcome(error);
-    const safeErrorDescription = classification.errorDetail || error.message || 'Unknown SMTP error';
+    smtpConfirmed = true;
+  } catch (smtpError: any) {
+    // STRICT ISOLATED SMTP ERROR BOUNDARY:
+    // Only actual SMTP or network transport errors are classified and handled here.
+    // PostgreSQL persistence errors are strictly excluded.
+    const classification = classifySmtpOutcome(smtpError);
+    const safeErrorDescription = classification.errorDetail || smtpError.message || 'Unknown SMTP error';
 
     // Outcome Category 5: Ambiguous SMTP outcome (connection lost or timeout during/after DATA)
     // Invariant: Never automatically retry an ambiguous (unknown) delivery
@@ -430,7 +396,103 @@ export async function processEmailJob(
     );
 
     // Rethrow error so BullMQ can schedule exponential backoff retry for transient/connection failures
-    throw error;
+    throw smtpError;
+  }
+
+  // --- 7. Database Persistence Phase (Post-SMTP Acceptance Error Boundary) ---
+  if (!smtpConfirmed || !sendResult) {
+    return;
+  }
+
+  // Simulated missing response-code metadata for testing
+  if (simulateNoResponseCode && config.app.nodeEnv !== 'production') {
+    const rawQueued = sendResult.response?.match(/queued as\s+(<[^>\s]+>|[^\s]+)/i);
+    sendResult.response = rawQueued
+      ? `OK: queued as ${rawQueued[1]}`
+      : 'OK: message queued for transmission';
+  }
+
+  // Extract genuine server message ID from SMTP response (e.g. queued as <...>) or client Message-ID
+  const queuedAsMatch = sendResult.response ? sendResult.response.match(/queued as\s+(<[^>\s]+>|[^\s]+)/i) : null;
+  const genuineMessageId = queuedAsMatch ? queuedAsMatch[1] : sendResult.messageId;
+
+  // Genuine response code: extract from server response, or NULL if unavailable (never substitute fabricated '250')
+  const responseCodeMatch = sendResult.response ? sendResult.response.match(/(?:^|\n)\s*([245]\d{2})\b/) : null;
+  const genuineResponseCode = responseCodeMatch ? responseCodeMatch[1] : null;
+
+  console.log(`   ✅ [Job ${jobId}] Email accepted by SMTP server! MessageId: ${genuineMessageId}`);
+
+  try {
+    // Simulated Database Persistence Failure for Testing
+    if (simulateDbFailureAfterSend && config.app.nodeEnv !== 'production') {
+      throw new Error('Simulated PostgreSQL connection failure immediately after SMTP acceptance.');
+    }
+
+    // Update canonical delivery and attempt to 'sent' with genuine messageId and genuine responseCode (null if unavailable)
+    await recordAttemptSuccess(claimedDelivery.id, attemptId, genuineMessageId, dbClient, genuineResponseCode);
+
+    // Record Success in historical email_logs
+    await dbClient.query(
+      `INSERT INTO email_logs (campaign_id, recipient_id, sender_id, status, error_message, sent_at)
+       VALUES ($1, $2, $3, 'sent', NULL, NOW())`,
+      [campaignId, recipientId, campaign.sender_id || null]
+    );
+
+    // Index in Elasticsearch (safely in background)
+    if (process.env.DISABLE_ES_INDEXING !== 'true') {
+      try {
+        await indexEmailAsSent(campaign, recipient, new Date());
+      } catch (esErr: any) {
+        console.error(`❌ [Elasticsearch] Sent email indexing failed: ${esErr.message}`);
+      }
+    }
+
+    // Check campaign completion status
+    try {
+      const remainingCheck = await dbClient.query(
+        `SELECT COUNT(*) as remaining FROM email_deliveries ed
+         WHERE ed.campaign_id = $1
+           AND ed.deleted_at IS NULL
+           AND ed.status != 'sent'`,
+        [campaignId]
+      );
+      const remaining = parseInt(remainingCheck.rows[0]?.remaining || '1', 10);
+      if (remaining === 0) {
+        await dbClient.query("UPDATE campaigns SET status = 'completed', updated_at = NOW() WHERE id = $1", [
+          campaignId,
+        ]);
+        console.log(`🎉 [Campaign ${campaignId}] All recipients processed. Campaign marked completed.`);
+
+        try {
+          await notifyCampaignCompleted(campaign.user_id, campaignId, campaign.subject);
+        } catch (slackErr: any) {
+          console.warn(`⚠️ [Slack] Failed to send completion notification: ${slackErr.message}`);
+        }
+      }
+    } catch (statusErr: any) {
+      console.warn(`⚠️ [Campaign ${campaignId}] Could not update status: ${statusErr.message}`);
+    }
+  } catch (dbErr: any) {
+    // Invariant: Database persistence failed AFTER confirmed SMTP acceptance.
+    // 1. DO NOT classify dbErr as an SMTP rejection or connection failure.
+    // 2. DO NOT allow BullMQ to retry or resend the email.
+    // 3. Mark delivery and attempt in safe uncertain/reconciliation state ('unknown').
+    // 4. Preserve genuine message ID so duplicate dispatch is permanently blocked.
+    console.error(
+      `💥 [Job ${jobId}] Database persistence failed AFTER confirmed SMTP acceptance (MessageId: ${genuineMessageId}): ${dbErr.message}`
+    );
+
+    await recordPostgresPersistenceFailure(
+      claimedDelivery.id,
+      attemptId,
+      genuineMessageId,
+      genuineResponseCode,
+      dbErr.message,
+      dbClient
+    );
+
+    // Complete job cleanly WITHOUT rethrowing so BullMQ does NOT blindly re-execute the job and resend the email!
+    return;
   }
 }
 

@@ -40,18 +40,27 @@ export interface SmtpClassificationResult {
  */
 export function classifySmtpOutcome(
   error: any,
-  context?: { dataSent?: boolean; command?: string }
+  context?: { dataSent?: boolean; command?: string; response?: string }
 ): SmtpClassificationResult {
   // If no error is present, outcome is confirmed acceptance
   if (!error) {
+    const rawResponse = context?.response ? String(context.response) : null;
+    let respCode: string | null = null;
+    let enhCode: string | null = null;
+    if (rawResponse) {
+      const match = rawResponse.match(/(?:^|\n)\s*([245]\d{2})\b/);
+      if (match) respCode = match[1];
+      const enhMatch = rawResponse.match(/\b([245]\.\d{1,3}\.\d{1,3})\b/);
+      if (enhMatch) enhCode = enhMatch[1];
+    }
     return {
       category: 'confirmed_acceptance',
       isRetryable: false,
-      responseCode: '250',
-      enhancedStatusCode: '2.0.0',
+      responseCode: respCode,
+      enhancedStatusCode: enhCode,
       messageId: null,
-      responseMessage: 'OK',
-      errorDetail: 'Success',
+      responseMessage: rawResponse,
+      errorDetail: 'Confirmed SMTP acceptance',
     };
   }
 
@@ -66,7 +75,7 @@ export function classifySmtpOutcome(
   if (error.responseCode && Number(error.responseCode) >= 200 && Number(error.responseCode) <= 599) {
     responseCode = String(error.responseCode);
   } else {
-    const match = rawResponse.match(/\b([245]\d{2})\b/) || rawMsg.match(/\b([245]\d{2})\b/);
+    const match = rawResponse.match(/(?:^|\n)\s*([245]\d{2})\b/) || rawMsg.match(/\b([245]\d{2})\b/);
     if (match) {
       responseCode = match[1];
     }

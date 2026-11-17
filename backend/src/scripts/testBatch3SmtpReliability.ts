@@ -38,7 +38,7 @@ import path from 'path';
 import nodemailer from 'nodemailer';
 import { runMigrations } from '../db/migrate';
 import { processEmailJob } from '../workers/emailWorker';
-import { getDelivery } from '../services/deliveryService';
+import { getDelivery, claimDelivery } from '../services/deliveryService';
 import { clearTransporterCache, setDefaultTransporter, resetDefaultTransporter } from '../services/emailService';
 import { safeEncrypt } from '../utils/crypto';
 
@@ -701,6 +701,52 @@ async function runBatch3Verification(): Promise<void> {
       assert(a8.rows[0].smtp_response_code === '250', 'SMTP response code is "250"');
 
       // ======================================================================
+      // SCENARIO 8b: Successful send where response-code metadata is unavailable (Batch 3.1 Bug 1)
+      // ======================================================================
+      console.log('\n' + SUB_SEP);
+      console.log('SCENARIO 8b: Successful send where response-code metadata is unavailable');
+      console.log(SUB_SEP);
+
+      clearTransporterCache();
+      smtpControl.mode = 'normal';
+      const actualServerMsgIdNoCode = '<no-code-acceptance-id-456@reachinbox.test>';
+      smtpControl.assignedMessageId = actualServerMsgIdNoCode;
+
+      const sender8bId = await createTestSender('Sender No Code', 'nocode@sender.test', 'user_nocode', 'pass');
+      const c8b = await testClient.query(`
+        INSERT INTO campaigns (user_id, sender_id, subject, body, status)
+        VALUES ($1, $2, 'No Response Code Test', 'Body', 'sending') RETURNING id;
+      `, [userId, sender8bId]);
+      const c8bId = c8b.rows[0].id;
+      const r8bId = await createTestRecip(c8bId, 'nocode_recip@reachinbox.test');
+
+      await processEmailJob(
+        {
+          id: `job_scenario_8b_${c8bId}`,
+          data: {
+            campaignId: c8bId,
+            recipientId: r8bId,
+            simulateNoResponseCode: true,
+          },
+          attemptsMade: 0,
+        },
+        testPool
+      );
+
+      const d8b = await getDelivery(c8bId, r8bId, testClient);
+      assert(d8b!.status === 'sent', 'Delivery marked "sent" despite missing response-code metadata');
+      assert(d8b!.smtp_message_id === actualServerMsgIdNoCode, 'Delivery stores exact genuine SMTP message ID');
+
+      const a8b = await testClient.query(
+        `SELECT * FROM email_attempts WHERE delivery_id = $1 ORDER BY attempt_number DESC LIMIT 1;`,
+        [d8b!.id]
+      );
+      assert(a8b.rows[0].status === 'sent', 'Attempt status is "sent"');
+      assert(a8b.rows[0].smtp_message_id === actualServerMsgIdNoCode, 'Attempt stores exact genuine SMTP message ID');
+      assert(a8b.rows[0].error_classification === 'confirmed_acceptance', 'Classification is "confirmed_acceptance"');
+      assert(a8b.rows[0].smtp_response_code === null, 'SMTP response code is strictly NULL (zero fabricated 250)');
+
+      // ======================================================================
       // SCENARIO 9: Ambiguous SMTP outcome becomes unknown and is not automatically retried
       // ======================================================================
       console.log('\n' + SUB_SEP);
@@ -795,6 +841,117 @@ async function runBatch3Verification(): Promise<void> {
       assert(betaSession !== undefined, 'SMTP server received Beta dispatch with "beta@solutions.test" From header');
       assert(alphaSession?.authUser === 'user_alpha', 'Alpha session authenticated with credentials for "user_alpha"');
       assert(betaSession?.authUser === 'user_beta', 'Beta session authenticated with credentials for "user_beta"');
+
+      // ======================================================================
+      // SCENARIO 11: PostgreSQL failure immediately after SMTP acceptance (Batch 3.1 Bug 2)
+      // ======================================================================
+      console.log('\n' + SUB_SEP);
+      console.log('SCENARIO 11: PostgreSQL failure immediately after SMTP acceptance');
+      console.log(SUB_SEP);
+
+      clearTransporterCache();
+      smtpControl.mode = 'normal';
+      const actualServerMsgIdDbFail = '<db-fail-accepted-789@reachinbox.test>';
+      smtpControl.assignedMessageId = actualServerMsgIdDbFail;
+
+      const sender11Id = await createTestSender('Sender DB Fail', 'dbfail@sender.test', 'user_dbfail', 'pass');
+      const c11 = await testClient.query(`
+        INSERT INTO campaigns (user_id, sender_id, subject, body, status)
+        VALUES ($1, $2, 'DB Fail After Send Test', 'Body', 'sending') RETURNING id;
+      `, [userId, sender11Id]);
+      const c11Id = c11.rows[0].id;
+      const r11Id = await createTestRecip(c11Id, 'db_fail_recip@reachinbox.test');
+
+      let c11Thrown = false;
+      try {
+        await processEmailJob(
+          {
+            id: `job_scenario_11_${c11Id}`,
+            data: {
+              campaignId: c11Id,
+              recipientId: r11Id,
+              simulateDbFailureAfterSend: true,
+            },
+            attemptsMade: 0,
+          },
+          testPool
+        );
+      } catch {
+        c11Thrown = true;
+      }
+
+      assert(!c11Thrown, 'Worker does NOT rethrow post-acceptance DB failure (prevents BullMQ auto-retry loops)');
+
+      const d11 = await getDelivery(c11Id, r11Id, testClient);
+      assert(d11!.status === 'unknown', 'Delivery transitioned to non-dispatchable "unknown" state for reconciliation');
+      assert(d11!.smtp_message_id === actualServerMsgIdDbFail, 'Delivery preserved genuine SMTP message ID despite DB failure');
+      assert(d11!.claim_owner === null, 'Claim owner cleared on persistence failure');
+      assert(d11!.lease_expires_at === null, 'Lease expiry cleared on persistence failure');
+      assert(
+        d11!.last_error !== null && d11!.last_error.includes('PostgreSQL persistence failure'),
+        'Delivery records clear PostgreSQL persistence failure context (not SMTP error)'
+      );
+
+      const a11 = await testClient.query(
+        `SELECT * FROM email_attempts WHERE delivery_id = $1 ORDER BY attempt_number DESC LIMIT 1;`,
+        [d11!.id]
+      );
+      assert(a11.rows[0].status === 'unknown', 'Attempt recorded as "unknown" to preserve audit trail');
+      assert(a11.rows[0].smtp_message_id === actualServerMsgIdDbFail, 'Attempt stores exact genuine SMTP message ID');
+      assert(a11.rows[0].error_classification === 'persistence_failure_after_acceptance', 'Classification is persistence_failure_after_acceptance');
+
+      // ======================================================================
+      // SCENARIO 12: Retry/recovery after database failure must NOT send email again (Batch 3.1 Bug 2)
+      // ======================================================================
+      console.log('\n' + SUB_SEP);
+      console.log('SCENARIO 12: Retry/recovery after DB failure must NOT send email again');
+      console.log(SUB_SEP);
+
+      // Count how many times the SMTP test server has accepted an email for this recipient so far
+      const initialSmtpSendsCount = smtpControl.sessions.filter(
+        (s) => s.rcptTo?.includes('db_fail_recip@reachinbox.test') && s.dataLines?.length > 0
+      ).length;
+      assert(initialSmtpSendsCount === 1, 'Initial send reached SMTP server exactly once');
+
+      // Attempt 1: Simulate BullMQ worker reprocessing the delivery
+      console.log('   Simulating BullMQ worker attempt on post-DB-failure delivery...');
+      await processEmailJob(
+        {
+          id: `job_scenario_12_retry_${c11Id}`,
+          data: {
+            campaignId: c11Id,
+            recipientId: r11Id,
+          },
+          attemptsMade: 1,
+        },
+        testPool
+      );
+
+      // Attempt 2: Verify claimDelivery refuses to claim the delivery
+      const claimAfterDbFail = await claimDelivery({
+        campaignId: c11Id,
+        recipientId: r11Id,
+        claimOwner: 'recovery_worker_probe',
+        leaseDurationMs: 60000,
+        dbClient: testClient,
+      });
+      assert(claimAfterDbFail === null, 'Recovery worker cannot claim delivery in "unknown" state');
+
+      // Verify SMTP server received ZERO duplicate sends
+      const finalSmtpSendsCount = smtpControl.sessions.filter(
+        (s) => s.rcptTo?.includes('db_fail_recip@reachinbox.test') && s.dataLines?.length > 0
+      ).length;
+      assert(finalSmtpSendsCount === initialSmtpSendsCount, 'SMTP server received ZERO duplicate dispatches (email was never resent)');
+
+      // Verify delivery status and attempt count remain unchanged
+      const d12 = await getDelivery(c11Id, r11Id, testClient);
+      assert(d12!.status === 'unknown', 'Delivery status strictly remains "unknown"');
+
+      const a12Count = await testClient.query(
+        `SELECT COUNT(*) as cnt FROM email_attempts WHERE delivery_id = $1;`,
+        [d11!.id]
+      );
+      assert(parseInt(a12Count.rows[0].cnt, 10) === 1, 'ZERO new attempts created (attempt_count remains 1)');
 
     } finally {
       resetDefaultTransporter();

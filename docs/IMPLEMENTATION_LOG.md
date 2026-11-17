@@ -434,3 +434,49 @@ Awaiting explicit operator authorization.
 | Phase 1 Database Test | `npm run phase1:test` | ✅ PASS | 16/16 assertions passed |
 | TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
 | Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched (6 baseline tables) |
+
+
+---
+
+## [Entry 008] - 2026-11-17 - Phase 1 Batch 3.1: SMTP Persistence Corrections
+
+**Scope:** Batch 3.1 – SMTP Persistence Corrections
+**Branch:** `feat/database-foundation`
+**Starting Baseline Commit:** `369e52bb51c75d2dbf3ee466159c581f47f10ed1`
+**Engineer:** Senior Backend Engineer
+
+### Implementation Summary
+
+1. **Remove Fabricated SMTP Response Metadata (`src/services/smtpClassifier.ts`, `src/services/deliveryService.ts`, `src/workers/emailWorker.ts`):**
+   - **Zero Fabrication Invariant:** Removed all hardcoded fallbacks to `'250'` and `'2.0.0'` across the codebase.
+   - When no actual server response exists or when response-code metadata is absent, `classifySmtpOutcome` and `emailWorker` record `responseCode: null` and `enhancedStatusCode: null`.
+   - Updated `deliveryService.recordAttemptSuccess` default parameter from `'250'` to `null`, ensuring PostgreSQL stores `NULL` in `email_attempts.smtp_response_code`.
+   - Confirmed SMTP acceptance is strictly preserved as `error_classification = 'confirmed_acceptance'` and delivery status `'sent'`, keeping acceptance separate from missing diagnostic metadata.
+   - Refined response-code parsing regex to RFC 5321 line-start anchors `/(?:^|\n)\s*([245]\d{2})\b/`, preventing arbitrary numbers inside message IDs from being misinterpreted as status codes.
+
+2. **Isolate SMTP Send from Database Persistence (`src/workers/emailWorker.ts`, `src/services/deliveryService.ts`):**
+   - **Isolated Error Boundaries:** Refactored `emailWorker.ts` so `sendEmail` operates inside a dedicated, isolated try/catch block. Only actual SMTP and network transport errors reach `classifySmtpOutcome`.
+   - **Exclusion of PostgreSQL Errors:** PostgreSQL database errors are never classified as SMTP rejections or connection failures.
+   - **No Duplicate Resends After Acceptance:** Once `sendEmail` confirms acceptance, any subsequent database persistence error (e.g., in `recordAttemptSuccess`, `email_logs`, or campaign completion status) enters a dedicated post-acceptance error handler. The job completes cleanly without rethrowing, eliminating BullMQ retry loops that would cause duplicate email dispatches.
+   - **Audit Trail & In-Doubt Reconciliation:** Implemented `recordPostgresPersistenceFailure` in `deliveryService.ts`. Transitions `email_deliveries` to terminal non-dispatchable `'unknown'` state with `claim_owner` and `lease_expires_at` cleared. Records `email_attempts` as `'unknown'` with `error_classification = 'persistence_failure_after_acceptance'` while preserving the genuine server message ID.
+   - **Resend Prevention:** Verified that worker idempotency checks (`delivery.status === 'unknown'`) and atomic claiming (`claimDelivery`) completely refuse to claim or dispatch deliveries in the `'unknown'` state, guaranteeing recovery processes never blindly resend an accepted delivery.
+
+3. **Acceptance Tests (`src/scripts/testBatch3SmtpReliability.ts`):**
+   - **Scenario 8:** Confirmed acceptance with genuine response code (`250`) and genuine message ID.
+   - **Scenario 8b:** Confirmed acceptance where response-code metadata is unavailable; verifies status is `'sent'`, genuine message ID is preserved, and `smtp_response_code` is strictly `NULL`.
+   - **Scenario 11:** PostgreSQL failure immediately after confirmed SMTP acceptance (`simulateDbFailureAfterSend: true`); verifies worker does not rethrow, delivery and attempt transition to `'unknown'`, and genuine message ID is preserved.
+   - **Scenario 12:** Subsequent retry/recovery after database failure; verifies worker skips execution, `claimDelivery` returns `null`, and the SMTP test server receives ZERO duplicate dispatches (count remains 1).
+   - **Scenarios 1-10:** All existing sender identity and SMTP classification tests remain 100% passing.
+
+### Actual Test Results
+
+| Test Suite | Command | Result | Notes |
+|---|---|---|---|
+| Batch 3 Verification Suite | `npm run batch3:test` | ✅ PASS | 69/69 assertions passed across all 12 SMTP reliability & persistence scenarios |
+| Batch 2 Verification Suite | `npm run batch2:test` | ✅ PASS | 25/25 assertions passed across all 9 outbox/persistence scenarios |
+| Batch 1 Verification Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
+| Isolated DB Migration Suite | `npm run isolated-db:test` | ✅ PASS | 31/31 assertions passed on real ephemeral PostgreSQL |
+| Stage 1 Invariant Suite | `npm run stage1:test` | ✅ PASS | 49/49 assertions passed |
+| Phase 1 Database Test | `npm run phase1:test` | ✅ PASS | 16/16 assertions passed |
+| TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
+| Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched (6 baseline tables) |
