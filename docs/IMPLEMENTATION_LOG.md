@@ -1259,3 +1259,54 @@ Implement a production-ready Slack integration using real Slack OAuth 2.0 and se
 | Batch 1 Regression Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
 | TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
 | Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched |
+
+---
+
+## 2026-11-18 – Entry 023: Batch 9.1 – Slack OAuth Replay Protection & Notification Reliability
+
+### Scope & Objective
+Harden Slack OAuth state security, eliminate secret exposure in test instrumentation and error logs, and implement resilient notification deduplication state management:
+1. **Authoritative One-Time OAuth State Security**:
+   - `connectSlack()`: Redis is the authoritative state store. If Redis is down during OAuth initiation, the request fails closed with HTTP 503 (`OAuth state service is currently unavailable. Please try again later.`), preventing unbacked session state creation.
+   - Clears legacy session state consistently upfront and on initiation (`delete req.session.slackOAuth; delete req.session.slackState`).
+   - `slackCallback()`: Consistently clears legacy session state upfront. Evaluates Redis state using atomic Lua `GET` and `DEL` script. If Redis is unavailable during callback evaluation, fails closed with HTTP 503 rather than silently falling back to session.
+   - If Redis returns null (state missing, expired, or previously consumed), callback strictly rejects with HTTP 400 (`CSRF validation failed: State is invalid, expired, or already used.`).
+   - Replay attack using the same session cookie is completely blocked.
+   - Two concurrent callbacks racing for the same state cannot both consume it: atomic Lua script guarantees exactly one succeeds (HTTP 200) and the other is rejected (HTTP 400).
+2. **Webhook Secret Protection & Production Hardening**:
+   - Removed `webhookUrl` completely from `testState.sentNotifications` instrumentation records; `sentNotifications` stores strictly `{ text, timestamp }`.
+   - In production (`process.env.NODE_ENV === 'production'`), `testState` instrumentation is completely inert (never records).
+   - Mock OAuth authorization codes and mock webhook URLs are strictly forbidden in production (rejected with explicit errors).
+   - Created `sanitizeSlackError()` helper to strip out webhook secret URLs (`[REDACTED_WEBHOOK_URL]`) and bot access tokens (`[REDACTED_SLACK_TOKEN]`) from all error messages, logs, and thrown exceptions.
+3. **Resilient Notification Deduplication with Explicit States**:
+   - Defined explicit notification delivery states: `'reserved'`, `'delivered'`, and `'uncertain'`.
+   - Initial notification attempt acquires an atomic lease (`SET dedupKey 'reserved' PX 15000 NX`), preventing concurrent duplicate dispatches across workers.
+   - On confirmed successful delivery, transitions state to `'delivered'` with full rate-limit window TTL (`waitMs`).
+   - On definite delivery failure (HTTP 4xx/5xx or post failure), atomically releases the reservation key via Lua, allowing subsequent alert attempts rather than suppressing valid alerts for the whole 1-hour window.
+   - On ambiguous timeout or connection interruption, transitions state to `'uncertain'` with full rate-limit window TTL, preventing duplicate alert spam to Slack.
+   - Safe error boundary: Slack errors never throw to the worker, ensuring email delivery claims, queue retry delays, and worker processing proceed uninterrupted.
+
+### Key Files Created & Modified
+1. `backend/src/controllers/slackAuthController.ts`: Redis authoritative state validation, fail-closed Redis handling, session fallback elimination, and session cleanup.
+2. `backend/src/services/slackService.ts`: Webhook secret removal from `testState`, error sanitization helper, uncertain timeout detection, explicit `'reserved' | 'delivered' | 'uncertain'` state transitions, and release on definite failure.
+3. `backend/package.json`: Registered `"batch9.1:test"` script.
+4. `backend/src/scripts/testBatch9_1SlackHardening.ts`: Dedicated 11-scenario, 43-assertion verification suite.
+5. `docs/IMPLEMENTATION_LOG.md`: Appended Entry 023.
+
+### Actual Test Results
+
+| Test Suite | Command | Result | Notes |
+|---|---|---|---|
+| Batch 9.1 Verification Suite | `npm run batch9.1:test` | ✅ PASS | 43/43 assertions passed across all 11 test scenarios |
+| Batch 9 Verification Suite | `npm run batch9:test` | ✅ PASS | 66/66 assertions passed across all 14 test scenarios |
+| Batch 8 Verification Suite | `npm run batch8:test` | ✅ PASS | 52/52 assertions passed across all 15 test scenarios |
+| Batch 7B Verification Suite | `npm run batch7b:test` | ✅ PASS | 63/63 assertions passed across all 17 test scenarios |
+| Batch 7A & 7A.2 Verification Suite | `npm run batch7a:test` | ✅ PASS | 119/119 assertions passed across all 16 test scenarios |
+| Batch 6 & 6.1 Verification Suite | `npm run batch6:test` | ✅ PASS | 108/108 assertions passed across all 19 test scenarios |
+| Batch 5 Verification Suite | `npm run batch5:test` | ✅ PASS | 142/142 assertions passed across all 21 test sections |
+| Batch 4 Regression Suite | `npm run batch4:test` | ✅ PASS | 51/51 assertions passed across all 10 scenarios |
+| Batch 3 Regression Suite | `npm run batch3:test` | ✅ PASS | 96/96 assertions passed across all 14 scenarios |
+| Batch 2 Regression Suite | `npm run batch2:test` | ✅ PASS | 25/25 assertions passed across all 9 outbox/persistence scenarios |
+| Batch 1 Regression Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
+| TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
+| Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched |

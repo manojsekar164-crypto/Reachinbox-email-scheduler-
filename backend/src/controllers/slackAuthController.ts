@@ -41,7 +41,7 @@ export async function connectSlack(req: Request, res: Response): Promise<void> {
   const state = crypto.randomBytes(32).toString('hex');
   const stateKey = `slack:oauth:state:${state}`;
 
-  // Store state in Redis with 10-minute expiration and user binding
+  // Store state in Redis with 10-minute expiration and user binding (AUTHORITATIVE STORE)
   try {
     await redis.set(
       stateKey,
@@ -50,16 +50,19 @@ export async function connectSlack(req: Request, res: Response): Promise<void> {
       OAUTH_STATE_TTL_SECONDS,
     );
   } catch (err) {
-    console.warn('⚠️  [SlackOAuth] Failed to persist state in Redis:', (err as Error).message);
+    console.error('❌ [SlackOAuth] Redis is unavailable during OAuth initiation:', (err as Error).message);
+    // FAIL CLOSED: Never continue or silently weaken security if Redis is down
+    res.status(503).json({
+      error: 'OAuth state service is currently unavailable. Please try again later.',
+    });
+    return;
   }
 
-  // Backup in session as secondary store
-  req.session.slackOAuth = {
-    state,
-    userId,
-    expiresAt: Date.now() + OAUTH_STATE_TTL_SECONDS * 1000,
-  };
-  req.session.slackState = state;
+  // Clear legacy session state consistently so stale session state cannot linger
+  if (req.session) {
+    delete (req.session as any).slackOAuth;
+    delete (req.session as any).slackState;
+  }
 
   // Minimum required scope: incoming-webhook
   const slackAuthUrl = `https://slack.com/oauth/v2/authorize?client_id=${clientId}&scope=incoming-webhook&redirect_uri=${encodeURIComponent(
@@ -91,6 +94,12 @@ export async function slackCallback(
   try {
     const { code, state } = req.query;
 
+    // Clear legacy session state consistently upfront so session state cannot linger or be reused
+    if (req.session) {
+      delete (req.session as any).slackOAuth;
+      delete (req.session as any).slackState;
+    }
+
     // 1. Verify user is authenticated
     if (!req.user || !(req.user as UserRow).id) {
       res.status(401).json({ error: 'Authentication required' });
@@ -106,12 +115,12 @@ export async function slackCallback(
       return;
     }
 
-    // 3. One-time atomic state validation and consumption from Redis
+    // 3. One-time atomic state validation and consumption from Redis (AUTHORITATIVE STORE)
     const stateKey = `slack:oauth:state:${state}`;
     let storedUserId: string | null = null;
 
     try {
-      // Atomic GET and DEL prevents replay attacks
+      // Atomic GET and DEL prevents replay attacks and races between concurrent callbacks
       const redisStateStr = (await redis.eval(
         "local v = redis.call('GET', KEYS[1]); if v then redis.call('DEL', KEYS[1]) end; return v",
         1,
@@ -123,25 +132,19 @@ export async function slackCallback(
         storedUserId = parsed.userId;
       }
     } catch (err) {
-      console.warn(
-        '⚠️  [SlackOAuth] Redis state evaluation error, checking session fallback:',
+      console.error(
+        '❌ [SlackOAuth] Redis is unavailable during OAuth callback verification:',
         (err as Error).message,
       );
-    }
-
-    // Check session fallback if Redis didn't hold it
-    if (!storedUserId && req.session.slackOAuth && req.session.slackOAuth.state === state) {
-      if (Date.now() < req.session.slackOAuth.expiresAt) {
-        storedUserId = req.session.slackOAuth.userId;
-      }
-      delete req.session.slackOAuth;
-      delete req.session.slackState;
-    } else if (!storedUserId && req.session.slackState && req.session.slackState === state) {
-      storedUserId = user.id;
-      delete req.session.slackState;
+      // FAIL CLOSED: If Redis is unavailable, reject with 503 instead of silently falling back
+      res.status(503).json({
+        error: 'OAuth verification service is currently unavailable. Please try again later.',
+      });
+      return;
     }
 
     // Reject invalid, expired, or replayed state
+    // Note: Redis is authoritative. Session fallback is strictly prohibited.
     if (!storedUserId) {
       res.status(400).json({
         error: 'CSRF validation failed: State is invalid, expired, or already used.',

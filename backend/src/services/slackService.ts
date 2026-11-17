@@ -16,15 +16,63 @@ export interface RateLimitNotificationOptions {
   globalLimit?: number;
 }
 
-// For testing purposes to verify notifications without requiring a live Slack channel
+export type NotificationDeliveryState = 'reserved' | 'delivered' | 'uncertain';
+
+export interface SentNotificationRecord {
+  text: string;
+  timestamp: number;
+}
+
+// For testing purposes to verify notifications without requiring a live Slack channel.
+// Webhook URLs and tokens are strictly excluded from testState instrumentation.
 export const testState = {
-  sentNotifications: [] as { text: string; timestamp: number; webhookUrl?: string | null }[],
+  sentNotifications: [] as SentNotificationRecord[],
   mockSendFailure: false,
+  mockTimeoutFailure: false,
 };
 
 export function clearTestState() {
   testState.sentNotifications = [];
   testState.mockSendFailure = false;
+  testState.mockTimeoutFailure = false;
+}
+
+/**
+ * Sanitizes any message or error text to ensure webhook secret URLs or access tokens
+ * are never leaked in logs, error objects, or test instrumentation.
+ */
+export function sanitizeSlackError(error: any): string {
+  const rawMessage = typeof error === 'string' ? error : error?.message || 'Unknown error';
+  return rawMessage
+    .replace(/https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9_\-\/]+/gi, 'https://hooks.slack.com/services/[REDACTED_WEBHOOK_URL]')
+    .replace(/xox[baprs]-[A-Za-z0-9\-]+/gi, '[REDACTED_SLACK_TOKEN]');
+}
+
+/**
+ * Checks whether an error represents an uncertain Slack outcome (e.g. timeout or connection drop)
+ * where the HTTP request may have reached Slack and been processed.
+ */
+export function isUncertainSlackError(error: any): boolean {
+  if (!error) return false;
+  if (error.name === 'AbortError' || error.name === 'SlackTimeoutError' || (error as any).isUncertain) {
+    return true;
+  }
+  const msg = (error.message || '').toLowerCase();
+  const code = (error.code || '').toLowerCase();
+  if (
+    msg.includes('timed out') ||
+    msg.includes('timeout') ||
+    msg.includes('abort') ||
+    msg.includes('econnreset') ||
+    msg.includes('socket hang up') ||
+    msg.includes('etimedout')
+  ) {
+    return true;
+  }
+  if (code === 'etimedout' || code === 'econnreset' || code === 'esockettimedout') {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -33,18 +81,29 @@ export function clearTestState() {
  *
  * @param text The message to send to Slack
  * @param customWebhookUrl Optional user-specific webhook URL
+ * @param injectedFetch Optional fetch function for testing
  */
 export async function sendSlackNotification(
   text: string,
   customWebhookUrl?: string | null,
+  injectedFetch: typeof fetch = fetch,
 ): Promise<void> {
   const webhookUrl = customWebhookUrl || process.env.SLACK_WEBHOOK_URL;
 
-  // Track notifications for integration testing assertions
-  testState.sentNotifications.push({ text, timestamp: Date.now(), webhookUrl });
+  // Track notifications for testing assertions ONLY in non-production environments.
+  // Webhook URLs and tokens are NEVER recorded in test arrays.
+  if (process.env.NODE_ENV !== 'production') {
+    testState.sentNotifications.push({ text, timestamp: Date.now() });
 
-  if (testState.mockSendFailure && process.env.NODE_ENV !== 'production') {
-    throw new Error('Mocked Slack HTTP post failure');
+    if (testState.mockSendFailure) {
+      throw new Error('Mocked Slack HTTP post failure');
+    }
+    if (testState.mockTimeoutFailure) {
+      const timeoutErr = new Error('Mocked Slack timeout after 5 seconds');
+      timeoutErr.name = 'AbortError';
+      (timeoutErr as any).isUncertain = true;
+      throw timeoutErr;
+    }
   }
 
   if (!webhookUrl || webhookUrl.trim() === '') {
@@ -52,22 +111,25 @@ export async function sendSlackNotification(
     return;
   }
 
-  // Allow test webhook URLs in non-production environments
+  // Check for mock webhook URLs
   const isMockUrl = webhookUrl.includes('mock-webhook') || webhookUrl.includes('test');
-  if (!webhookUrl.startsWith('https://hooks.slack.com/services/') && (!isMockUrl || process.env.NODE_ENV === 'production')) {
-    throw new Error('Invalid Slack Webhook URL configuration: must start with "https://hooks.slack.com/services/"');
+  if (isMockUrl) {
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error('Mock webhook URLs are strictly forbidden in production environment.');
+    }
+    // Safe simulated delivery in test mode
+    return;
   }
 
-  // If in test mode with mock URL, simulate successful delivery without sending actual internet requests
-  if (isMockUrl && process.env.NODE_ENV !== 'production') {
-    return;
+  if (!webhookUrl.startsWith('https://hooks.slack.com/services/')) {
+    throw new Error('Invalid Slack Webhook URL configuration: must start with "https://hooks.slack.com/services/"');
   }
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 5000);
 
   try {
-    const response = await fetch(webhookUrl, {
+    const response = await injectedFetch(webhookUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -84,9 +146,12 @@ export async function sendSlackNotification(
   } catch (error: any) {
     clearTimeout(timeoutId);
     if (error.name === 'AbortError') {
-      throw new Error('Slack notification request timed out after 5 seconds');
+      const timeoutErr = new Error('Slack notification request timed out after 5 seconds');
+      timeoutErr.name = 'AbortError';
+      (timeoutErr as any).isUncertain = true;
+      throw timeoutErr;
     }
-    throw error;
+    throw new Error(sanitizeSlackError(error));
   }
 }
 
@@ -103,6 +168,7 @@ export async function handleRateLimitNotification(
   legacyWaitMs?: number,
   injectedPool: Pool | PoolClient = defaultPool,
   injectedRedis: Redis = defaultRedis,
+  injectedSender?: (text: string, webhookUrl: string) => Promise<void>,
 ): Promise<void> {
   try {
     // Normalize options
@@ -148,7 +214,7 @@ export async function handleRateLimitNotification(
       return;
     }
 
-    // 3. Deduplication via Redis
+    // 3. Deduplication via Redis with explicit states: 'reserved', 'delivered', 'uncertain'
     const windowEpoch = Math.floor((Date.now() + waitMs) / 1000);
     let dedupKey: string;
 
@@ -163,11 +229,20 @@ export async function handleRateLimitNotification(
       dedupKey = `slack:ratelimit:notified:campaign:${campaignId}:${windowEpoch}`;
     }
 
-    const ttlMs = Math.max(waitMs, 1000);
-    const acquired = await injectedRedis.set(dedupKey, '1', 'PX', ttlMs, 'NX');
+    // Acquire atomic reservation with an in-progress lease
+    // This prevents concurrent duplicate notifications during HTTP dispatch
+    const RESERVATION_LEASE_MS = 15000;
+    let acquired: string | null = null;
+    try {
+      acquired = await injectedRedis.set(dedupKey, 'reserved', 'PX', RESERVATION_LEASE_MS, 'NX');
+    } catch (redisErr) {
+      console.warn(`⚠️  [Slack] Redis error checking notification reservation: ${sanitizeSlackError(redisErr)}`);
+      // If Redis fails, return safely without failing email delivery
+      return;
+    }
 
     if (acquired !== 'OK') {
-      // Already notified within the active window
+      // Slot already reserved, delivered, or uncertain within the active window
       return;
     }
 
@@ -211,11 +286,46 @@ export async function handleRateLimitNotification(
     }
 
     // 5. Send Slack notification via user's encrypted webhook URL
-    await sendSlackNotification(message, integration.webhook_url);
-    console.log(`✅ [Slack] Notification sent successfully for campaign ${campaignId} (reason: ${reason})`);
+    const ttlMs = Math.max(waitMs, 1000);
+    try {
+      if (injectedSender) {
+        await injectedSender(message, integration.webhook_url);
+      } else {
+        await sendSlackNotification(message, integration.webhook_url);
+      }
+
+      // SUCCESS: Transition state to 'delivered' with full window TTL
+      try {
+        await injectedRedis.set(dedupKey, 'delivered', 'PX', ttlMs);
+      } catch {}
+      console.log(`✅ [Slack] Notification sent successfully for campaign ${campaignId} (reason: ${reason})`);
+    } catch (deliveryError: any) {
+      const isUncertain = isUncertainSlackError(deliveryError);
+
+      if (isUncertain) {
+        // UNCERTAIN: Timeout or connection interruption after submission.
+        // Record 'uncertain' with full window TTL to prevent uncontrolled duplicate spam.
+        try {
+          await injectedRedis.set(dedupKey, 'uncertain', 'PX', ttlMs);
+        } catch {}
+        console.warn(`⚠️  [Slack] Notification outcome is uncertain (timeout/network interruption) for campaign ${campaignId}: ${sanitizeSlackError(deliveryError)}`);
+      } else {
+        // DEFINITE FAILURE (e.g. HTTP 4xx, HTTP 500, invalid config):
+        // Clear the reservation so valid alerts are NOT permanently suppressed for the whole rate-limit window.
+        try {
+          await injectedRedis.eval(
+            "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end",
+            1,
+            dedupKey,
+            'reserved',
+          );
+        } catch {}
+        console.error(`❌ [Slack] Notification failed: ${sanitizeSlackError(deliveryError)}`);
+      }
+    }
   } catch (error: any) {
     // 6. Safe error boundary: never fail worker processing or trigger email retries
-    console.error(`❌ [Slack] Notification failed: ${error.message}`);
+    console.error(`❌ [Slack] Notification failed: ${sanitizeSlackError(error)}`);
   }
 }
 
@@ -263,7 +373,7 @@ export async function notifyCampaignCreated(
     await sendSlackNotification(message, integration.webhook_url);
     console.log(`✅ [Slack] Campaign created notification sent for: ${subject}`);
   } catch (err: any) {
-    console.warn(`⚠️ [Slack] Campaign created notification failed: ${err.message}`);
+    console.warn(`⚠️ [Slack] Campaign created notification failed: ${sanitizeSlackError(err)}`);
   }
 }
 
@@ -296,6 +406,6 @@ ${detail}`.trim();
     await sendSlackNotification(message, integration.webhook_url);
     console.log(`✅ [Slack] Campaign completed notification sent for: ${subject}`);
   } catch (err: any) {
-    console.warn(`⚠️ [Slack] Campaign completed notification failed: ${err.message}`);
+    console.warn(`⚠️ [Slack] Campaign completed notification failed: ${sanitizeSlackError(err)}`);
   }
 }
