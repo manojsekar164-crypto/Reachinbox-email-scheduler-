@@ -1,7 +1,7 @@
 import { Worker, Job, DelayedError } from 'bullmq';
 import { emailQueueName, EmailJobPayload, redisConnectionOptions } from '../queue/emailQueue';
 import { sendEmail } from '../services/emailService';
-import { checkRateLimit } from '../services/rateLimiter';
+import { checkRateLimit, checkSenderRateLimit } from '../services/rateLimiter';
 import { handleRateLimitNotification, notifyCampaignCompleted } from '../services/slackService';
 import { indexEmailAsSent } from '../services/searchService';
 import { db as pool } from '../db/postgres';
@@ -17,17 +17,21 @@ import { checkSendSpacing } from '../services/sendSpacing';
  * This runs independently from the HTTP API.
  */
 
+const workerConcurrency = config.app.workerConcurrency;
 console.log(`👷 Starting worker for queue: ${emailQueueName}`);
-console.log(`⚙️  Concurrency: 2`);
+console.log(`⚙️  Concurrency: ${workerConcurrency}`);
 
 export const worker = new Worker<EmailJobPayload, void, string>(
   emailQueueName,
   async (job: Job<EmailJobPayload>) => {
-    const { campaignId, recipientId, simulateFailure, testWindowSeconds } = job.data as EmailJobPayload & { simulateFailure?: boolean, testWindowSeconds?: number };
-    
+    const { campaignId, recipientId, simulateFailure, testWindowSeconds } = job.data as EmailJobPayload & {
+      simulateFailure?: boolean;
+      testWindowSeconds?: number;
+    };
+
     // In BullMQ, job.attemptsMade starts at 0 for the first attempt during execution.
     const attempt = job.attemptsMade + 1;
-    
+
     console.log(`\n⏳ [Job ${job.id}] Attempt ${attempt}`);
     console.log(`   campaign=${campaignId}`);
     console.log(`   recipient=${recipientId}`);
@@ -54,25 +58,29 @@ export const worker = new Worker<EmailJobPayload, void, string>(
     if (campaign.sender_id) {
       sender = await getSenderByIdInternal(campaign.sender_id);
       if (!sender) {
-        throw new Error(`Job missing DB records: senderId=${campaign.sender_id} referenced by campaignId=${campaignId}`);
+        throw new Error(
+          `Job missing DB records: senderId=${campaign.sender_id} referenced by campaignId=${campaignId}`
+        );
       }
       if (sender.user_id !== campaign.user_id) {
-        throw new Error(`Security validation failed: Sender user_id ${sender.user_id} does not match campaign user_id ${campaign.user_id}.`);
+        throw new Error(
+          `Security validation failed: Sender user_id ${sender.user_id} does not match campaign user_id ${campaign.user_id}.`
+        );
       }
     }
 
-    // --- 2. Idempotency Check ---
+    // --- 2. Pre-flight Idempotency Check ---
     const sentCheck = await pool.query(
       "SELECT id FROM email_logs WHERE campaign_id = $1 AND recipient_id = $2 AND status = 'sent' LIMIT 1",
       [campaignId, recipientId]
     );
-    
+
     if (sentCheck.rows.length > 0) {
       console.log(`   ⏭️ [Job ${job.id}] Idempotency check: Already sent successfully. Skipping.`);
       return; // Job succeeds immediately without sending again
     }
 
-    // --- 2.5. Rate Limit Check ---
+    // --- 2.5. Campaign Rate Limit Check ---
     const windowSeconds =
       testWindowSeconds ||
       (process.env['RATE_LIMIT_WINDOW_SECONDS']
@@ -81,8 +89,10 @@ export const worker = new Worker<EmailJobPayload, void, string>(
     const { allowed, waitMs } = await checkRateLimit(campaignId, campaign.hourly_limit, windowSeconds);
 
     if (!allowed) {
-      console.log(`   ⏳ [Job ${job.id}] Rate limit reached for campaign ${campaignId}. Delaying for ${waitMs}ms`);
-      
+      console.log(
+        `   ⏳ [Job ${job.id}] Rate limit reached for campaign ${campaignId}. Delaying for ${waitMs}ms`
+      );
+
       // Trigger Slack notification (errors are internally handled and isolated)
       await handleRateLimitNotification(campaignId, campaign.hourly_limit, waitMs);
 
@@ -92,20 +102,33 @@ export const worker = new Worker<EmailJobPayload, void, string>(
       throw new DelayedError();
     }
 
+    // --- 2.6. Shared Sender Rate Limit Check ---
+    if (sender && sender.hourly_limit && sender.hourly_limit > 0) {
+      const senderLimitCheck = await checkSenderRateLimit(sender.id, sender.hourly_limit, windowSeconds);
+      if (!senderLimitCheck.allowed) {
+        console.log(
+          `   ⏳ [Job ${job.id}] Shared sender rate limit reached for sender ${sender.id} (${sender.email}). Delaying for ${senderLimitCheck.waitMs}ms`
+        );
+        const delayMs = Math.max(senderLimitCheck.waitMs, 1000);
+        await job.moveToDelayed(Date.now() + delayMs, job.token);
+        throw new DelayedError();
+      }
+    }
+
     // --- 3. Build Email Content ---
     const nameReplacement = recipient.name || 'there';
     const subject = campaign.subject.replace(/\{\{name\}\}/g, nameReplacement);
     const bodyText = campaign.body.replace(/\{\{name\}\}/g, nameReplacement);
-    
+
     // For HTML, safely replace newlines with <br> tags. We assume campaign.body is plain text.
     const bodyHtml = bodyText.replace(/\n/g, '<br>');
 
     // --- 4. Simulate Failure if requested (for testing retry behavior) ---
-    if (simulateFailure && attempt === 1) {
+    if (simulateFailure && attempt === 1 && config.app.nodeEnv !== 'production') {
       console.log(`   💥 [Job ${job.id}] Intentional test failure`);
       console.log(`   ⏳ [Job ${job.id}] Retrying`);
       const errorMsg = 'Simulated processing failure for testing retries.';
-      
+
       // Log the failure
       await pool.query(
         'INSERT INTO email_logs (campaign_id, recipient_id, sender_id, status, error_message, sent_at) VALUES ($1, $2, $3, $4, $5, NULL)',
@@ -146,11 +169,22 @@ export const worker = new Worker<EmailJobPayload, void, string>(
         console.log(`   👀 Ethereal Preview: ${result.previewUrl}`);
       }
 
-      // Record Success
-      await pool.query(
-        "INSERT INTO email_logs (campaign_id, recipient_id, sender_id, status, error_message, sent_at) VALUES ($1, $2, $3, 'sent', NULL, NOW())",
+      // Record Success with database-level idempotency protection
+      const insertResult = await pool.query(
+        `INSERT INTO email_logs (campaign_id, recipient_id, sender_id, status, error_message, sent_at)
+         VALUES ($1, $2, $3, 'sent', NULL, NOW())
+         ON CONFLICT (campaign_id, recipient_id) WHERE status = 'sent'
+         DO NOTHING
+         RETURNING id`,
         [campaignId, recipientId, campaign.sender_id || null]
       );
+
+      if (insertResult.rows.length === 0) {
+        console.log(
+          `   ⏭️ [Job ${job.id}] Idempotency notice: Delivery record already exists in email_logs. Skipping duplicate post-processing.`
+        );
+        return;
+      }
 
       // Index in Elasticsearch (safely in background, catching all errors)
       try {
@@ -173,7 +207,7 @@ export const worker = new Worker<EmailJobPayload, void, string>(
         if (remaining === 0) {
           await pool.query("UPDATE campaigns SET status = 'completed', updated_at = NOW() WHERE id = $1", [campaignId]);
           console.log(`🎉 [Campaign ${campaignId}] All recipients processed. Campaign marked completed.`);
-          
+
           // Send completion notification to Slack
           try {
             await notifyCampaignCompleted(campaign.user_id, campaignId, campaign.subject);
@@ -181,16 +215,18 @@ export const worker = new Worker<EmailJobPayload, void, string>(
             console.warn(`⚠️ [Slack] Failed to send completion notification: ${slackErr.message}`);
           }
         } else {
-          await pool.query("UPDATE campaigns SET status = 'sending', updated_at = NOW() WHERE id = $1 AND status != 'sending'", [campaignId]);
+          await pool.query(
+            "UPDATE campaigns SET status = 'sending', updated_at = NOW() WHERE id = $1 AND status != 'sending'",
+            [campaignId]
+          );
         }
       } catch (statusErr: any) {
         console.warn(`⚠️ [Campaign ${campaignId}] Could not update status: ${statusErr.message}`);
       }
-      
     } catch (error: any) {
       // --- 6. Handle Send Failure ---
       console.error(`   ❌ [Job ${job.id}] Nodemailer send failed:`, error.message);
-      
+
       const safeErrorDescription = error.message || 'Unknown SMTP error';
       await pool.query(
         "INSERT INTO email_logs (campaign_id, recipient_id, sender_id, status, error_message, sent_at) VALUES ($1, $2, $3, 'failed', $4, NULL)",
@@ -203,7 +239,7 @@ export const worker = new Worker<EmailJobPayload, void, string>(
   },
   {
     connection: redisConnectionOptions,
-    concurrency: 2, // Process up to 2 jobs concurrently
+    concurrency: workerConcurrency,
   }
 );
 
@@ -230,8 +266,6 @@ worker.on('error', (err) => {
 async function shutdown() {
   console.log('\n⚠️  Shutting down worker gracefully...');
   await worker.close();
-  // Do not close the pool here unless we are sure nothing else is using it,
-  // but since this is a dedicated worker process, it's safe to close.
   await pool.end();
   console.log('👋 Worker closed.');
   process.exit(0);

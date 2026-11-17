@@ -1,5 +1,6 @@
-# ANTIGRAVITY WORKING BRIEF — ReachInbox Intelligent Email Delivery Platform
+# ANTIGRAVITY WORKING BRIEF — REACHINBOX EMAIL DELIVERY PLATFORM
 
+**Date:** 2026-11-17  
 **Version:** 1.0.0  
 **Repository:** `https://github.com/manojsekar164-crypto/Reachinbox-email-scheduler-.git`  
 **Active Development Branch:** `feat/database-foundation`  
@@ -31,14 +32,18 @@ ReachInbox is an intelligent, high-throughput email delivery and campaign schedu
 ## 2. Non-Negotiable Architectural Mandates
 
 1. **ABSOLUTELY NO CRON JOBS:** No `crontab`, `node-cron`, `agenda`, `setInterval` polling, or cron libraries.
-2. **BullMQ / Persistent DB & Redis Scheduling:** Exact scheduling without polling loops.
+2. **BullMQ / Persistent DB & Redis Scheduling:** Exact scheduling without polling loops (`delayMs = Math.max(0, scheduledAt.getTime() - Date.now())`).
 3. **PostgreSQL as Permanent Source of Truth:** All persistent state (users, campaigns, recipients, deliveries, attempts, outbox, senders, OAuth tokens) lives in PostgreSQL.
-4. **Crash & Restart Durability:** Future scheduled jobs must survive restarts.
+4. **Crash & Restart Durability:** Future scheduled jobs must survive restarts. Redis persists queued and delayed jobs.
 5. **No Blind Resending:** Emails already sent must never be blindly resent or re-dispatched.
 6. **Per-Delivery Idempotency:** Every recipient delivery must be guarded by a PostgreSQL unique constraint and deterministic keys.
-7. **Real SMTP Delivery:** Never fake SMTP success. Real errors must propagate for exponential retry and failure tracking.
-8. **Preserve Existing Functionality & Production Data:** Never delete existing working features, and never reset or drop existing data.
-9. **No Secrets in Source:** Never commit secrets, tokens, or `.env` files.
+7. **Real SMTP Delivery:** Never fake SMTP success. No synthetic message IDs or simulated preview URLs on delivery failure; real errors must propagate for exponential retry and failure tracking.
+8. **Shared Sender-Level Rate Limiting:** Enforce shared hourly rate limits per SMTP sender across multiple campaigns in addition to campaign-level rate limits.
+9. **Configurable Worker Concurrency:** Concurrency must be environment-driven via `WORKER_CONCURRENCY` (defaulting safely to 2).
+10. **Configurable Inter-Email Spacing:** Minimum inter-send delay must be configurable via `EMAIL_SEND_DELAY_MS` (default 2000ms).
+11. **Preserve Existing Functionality & Production Data:** Never delete existing working features, and never reset or drop existing data.
+12. **No Frontend Modifications During Phase 1:** Keep changes focused on the backend and database architecture.
+13. **No Secrets in Source:** Never commit secrets, tokens, or `.env` files.
 
 ---
 
@@ -78,28 +83,33 @@ Stage 1 builds the durable PostgreSQL foundation that supports individual email 
   - `smtp_response_code`, `smtp_message_id`, `error_classification`, `error_message`
   - `attempted_at`, `completed_at`
 - Unique constraint on `(delivery_id, attempt_number)`.
-- Existing `email_logs` table preserved intact as historical audit trail.
 
 ### 3.4 Transactional Outbox Schema (`delivery_outbox`)
-- Outbox schema for Stage 2 transactional publishing:
+- Reliable event publishing table:
   - `id`: UUID PRIMARY KEY
   - `event_type`: VARCHAR NOT NULL
   - `aggregate_id`: UUID NOT NULL
   - `deduplication_key`: VARCHAR NOT NULL UNIQUE
   - `payload`: JSONB NOT NULL
-  - `status`: VARCHAR NOT NULL DEFAULT 'pending' (CHECK constraint: `pending`, `processing`, `dispatched`, `failed`)
-  - `attempt_count`, `available_at`, `created_at`, `dispatched_at`, `last_error`
-- Indexes on `(status, available_at)` and `aggregate_id`.
+  - `status`: VARCHAR NOT NULL (CHECK constraint: `pending`, `processing`, `dispatched`, `failed`)
+  - `attempt_count`: INTEGER NOT NULL DEFAULT 0
+  - `available_at`, `dispatched_at`, `last_error`, `created_at`
+- Unique constraint `uq_delivery_outbox_dedup (deduplication_key)`.
 
-### 3.5 Historical Data Backfill
-- Safe, non-destructive migration converting legacy `email_logs` and `recipients` into `email_deliveries` and `email_attempts`.
-- Preserves historical sent, failed, and pending statuses without triggering sends or restarting old campaigns.
+### 3.5 Historical Backfill Migration (`005_backfill_historical_deliveries.sql` / `007`)
+- Safe, non-destructive migration that:
+  - Populates `email_deliveries` from existing `recipients`, `campaigns`, and `email_logs`.
+  - Maps existing states accurately: sent -> `sent`, failed -> `failed`, scheduled -> `scheduled`, draft -> `pending`, completed/terminated -> `cancelled`.
+  - Populates `email_attempts` from historical `email_logs`.
+  - Uses `ON CONFLICT DO NOTHING`.
+  - Zero historical campaigns restarted or resent.
 
-### 3.6 SMTP Credential Encryption
-- Authenticated AES-256-GCM encryption with `enc:v1:` version prefix.
-- Separate `ENCRYPTION_KEY` from `SESSION_SECRET`.
-- Production startup fails closed when `ENCRYPTION_KEY` is missing or invalid.
-- Transparent encryption on write and decryption on read in `senderService.ts`.
+### 3.6 Cryptographic Security (`backend/src/utils/crypto.ts`)
+- Authenticated AES-256-GCM encryption with 96-bit random IV and 128-bit authentication tag.
+- Idempotent: does not double-encrypt already-encrypted data.
+- Transparent backward compatibility: handles legacy unencrypted passwords safely.
+- Fail-closed in production: missing or weak `ENCRYPTION_KEY` halts startup.
 
 ### 3.7 Database Type Consistency
 - Synchronized `db.types.ts` with all delivery, attempt, and outbox tables and status constraints.
+- Aligned `CampaignStatus` to include `'completed'`.

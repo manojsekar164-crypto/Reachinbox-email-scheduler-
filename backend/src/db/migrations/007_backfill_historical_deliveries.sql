@@ -1,5 +1,5 @@
 -- =============================================================================
--- Migration: 005_backfill_historical_deliveries
+-- Migration: 007_backfill_historical_deliveries
 -- Description: Safely backfills existing recipients and email_logs into the
 --              new email_deliveries and email_attempts models.
 --

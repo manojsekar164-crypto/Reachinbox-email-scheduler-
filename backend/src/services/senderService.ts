@@ -5,7 +5,11 @@
  *
  * Key features:
  *  - Raw SQL queries via pg pool following existing database service conventions.
+<<<<<<< HEAD
  *  - Transparent AES-256-GCM authenticated credential encryption at rest.
+=======
+ *  - Encrypts sensitive credentials (smtp_pass) at rest using AES-256-GCM.
+>>>>>>> origin/feat/database-foundation
  *  - Restricts access strictly to the owner using `user_id = $N`.
  *  - Handles sender deletions, throwing descriptive errors if foreign key restrains deletion.
  *  - Supports shared sender-level hourly rate limits.
@@ -45,6 +49,7 @@ function mapSenderRow(row: SenderRow | null): SenderRow | null {
     hourly_limit: row.hourly_limit ?? 100,
   };
 }
+const decryptSenderRow = mapSenderRow;
 
 /**
  * Creates a new sender record with credentials encrypted at rest.

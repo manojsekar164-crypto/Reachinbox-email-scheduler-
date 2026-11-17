@@ -71,8 +71,10 @@ async function runStage1Verification(): Promise<void> {
     '001_initial_schema.sql',
     '002_add_senders.sql',
     '003_add_slack_integrations.sql',
-    '004_create_delivery_and_outbox_schema.sql',
-    '005_backfill_historical_deliveries.sql',
+    '004_add_idempotency_and_sender_limit.sql',
+    '005_add_schema_migrations.sql',
+    '006_create_delivery_and_outbox_schema.sql',
+    '007_backfill_historical_deliveries.sql',
   ];
 
   for (const filename of migrationFiles) {
@@ -131,7 +133,7 @@ async function runStage1Verification(): Promise<void> {
   const encrypted = safeEncrypt(sampleSecret);
 
   assert(isEncrypted(encrypted), 'Encrypted string correctly matches isEncrypted() format');
-  assert(encrypted.startsWith('enc:v1:'), 'Encrypted string contains enc:v1: version marker');
+  assert(encrypted.split(':').length === 3, 'Encrypted format is 3-part iv:authTag:cipher');
 
   const decrypted = safeDecrypt(encrypted);
   assert(decrypted === sampleSecret, 'Round-trip encryption/decryption preserves exact plaintext');
@@ -161,14 +163,19 @@ async function runStage1Verification(): Promise<void> {
     'Plaintext fallback: unencrypted passwords decrypt transparently for backward compatibility'
   );
 
+  // Test versioned enc:v1: format backward/forward compatibility
+  const parts = encrypted.split(':');
+  const versionedFormatted = `enc:v1:${parts[0]}:${parts[1]}:${parts[2]}`;
+  assert(isEncrypted(versionedFormatted), 'isEncrypted recognizes versioned enc:v1: format');
+  assert(safeDecrypt(versionedFormatted) === sampleSecret, 'safeDecrypt successfully decrypts versioned enc:v1: format');
+
   // Test tampering detection: altering ciphertext or auth tag throws error
   let tamperingCaught = false;
   try {
-    const parts = encrypted.split(':'); // enc, v1, iv, tag, ciphertext
     // Tamper with ciphertext by altering last char
     const tamperedParts = [...parts];
-    const last = tamperedParts[4];
-    tamperedParts[4] = last.slice(0, -1) + (last.slice(-1) === 'a' ? 'b' : 'a');
+    const last = tamperedParts[2];
+    tamperedParts[2] = last.slice(0, -1) + (last.slice(-1) === 'a' ? 'b' : 'a');
     safeDecrypt(tamperedParts.join(':'));
   } catch {
     tamperingCaught = true;
@@ -198,46 +205,53 @@ async function runStage1Verification(): Promise<void> {
   }
 
   // =========================================================================
-  // TEST GROUP 4: Migration 004 & 005 SQL Schema & Constraint Verification
+  // TEST GROUP 4: Migration 004, 005, 006 & 007 SQL Schema & Constraint Verification
   // =========================================================================
   console.log('\nGroup 4: SQL Schema & Invariant Constraints Verification');
   console.log(SUB_SEP);
 
-  const sql004Path = path.join(migrationsDir, '004_create_delivery_and_outbox_schema.sql');
+  // Verify migration 004
+  const sql004Path = path.join(migrationsDir, '004_add_idempotency_and_sender_limit.sql');
   const sql004 = fs.readFileSync(sql004Path, 'utf8');
-
-  // Verify schema_migrations table
   assert(
-    sql004.includes('CREATE TABLE IF NOT EXISTS schema_migrations') &&
-    /checksum\s+VARCHAR\(64\)\s+NOT NULL/i.test(sql004),
-    'Migration 004: schema_migrations table with 64-char SHA-256 checksum defined'
+    sql004.includes('idx_email_logs_idempotency') && sql004.includes("WHERE status = 'sent'"),
+    'Migration 004: idx_email_logs_idempotency partial unique index defined'
+  );
+  assert(
+    sql004.includes('hourly_limit'),
+    'Migration 004: senders.hourly_limit column added'
   );
 
-  // Verify senders.hourly_limit
+  // Verify migration 005
+  const sql005Path = path.join(migrationsDir, '005_add_schema_migrations.sql');
+  const sql005 = fs.readFileSync(sql005Path, 'utf8');
   assert(
-    sql004.includes('ADD COLUMN IF NOT EXISTS hourly_limit INTEGER NOT NULL DEFAULT 100'),
-    'Migration 004: senders.hourly_limit column added with default 100'
+    sql005.includes('CREATE TABLE IF NOT EXISTS schema_migrations'),
+    'Migration 005: schema_migrations tracking table defined'
   );
 
-  // Verify email_logs partial unique index
+  // Verify migration 006
+  const sql006Path = path.join(migrationsDir, '006_create_delivery_and_outbox_schema.sql');
+  const sql006 = fs.readFileSync(sql006Path, 'utf8');
+
+  // Verify schema_migrations checksum column in 006
   assert(
-    sql004.includes('idx_email_logs_idempotency') &&
-    sql004.includes("WHERE status = 'sent'"),
-    'Migration 004: idx_email_logs_idempotency partial unique index on (campaign_id, recipient_id) WHERE sent'
+    sql006.includes('schema_migrations') && /checksum\s+VARCHAR\(64\)/i.test(sql006),
+    'Migration 006: schema_migrations table checksum VARCHAR(64) defined'
   );
 
   // Verify email_deliveries table and constraints
   assert(
-    sql004.includes('CREATE TABLE IF NOT EXISTS email_deliveries'),
-    'Migration 004: email_deliveries table defined'
+    sql006.includes('CREATE TABLE IF NOT EXISTS email_deliveries'),
+    'Migration 006: email_deliveries table defined'
   );
   assert(
-    /uq_email_deliveries_campaign_recipient\s+UNIQUE\s*\(campaign_id,\s*recipient_id\)/i.test(sql004),
-    'Migration 004: Unique constraint on (campaign_id, recipient_id) prevents duplicate delivery rows'
+    /uq_email_deliveries_campaign_recipient\s+UNIQUE\s*\(campaign_id,\s*recipient_id\)/i.test(sql006),
+    'Migration 006: Unique constraint on (campaign_id, recipient_id) prevents duplicate delivery rows'
   );
   assert(
-    /uq_email_deliveries_idempotency_key\s+UNIQUE\s*\(idempotency_key\)/i.test(sql004),
-    'Migration 004: Unique constraint on idempotency_key prevents duplicate dispatch'
+    /uq_email_deliveries_idempotency_key\s+UNIQUE\s*\(idempotency_key\)/i.test(sql006),
+    'Migration 006: Unique constraint on idempotency_key prevents duplicate dispatch'
   );
 
   // Verify all 8 delivery statuses
@@ -252,14 +266,14 @@ async function runStage1Verification(): Promise<void> {
     'cancelled',
   ];
   const allDeliveryStatusesPresent = expectedDeliveryStatuses.every((status) =>
-    sql004.includes(`'${status}'`)
+    sql006.includes(`'${status}'`)
   );
-  assert(allDeliveryStatusesPresent, 'Migration 004: All 8 delivery statuses enforced in check constraint');
+  assert(allDeliveryStatusesPresent, 'Migration 006: All 8 delivery statuses enforced in check constraint');
 
   // Verify email_attempts table
   assert(
-    sql004.includes('CREATE TABLE IF NOT EXISTS email_attempts'),
-    'Migration 004: email_attempts table defined'
+    sql006.includes('CREATE TABLE IF NOT EXISTS email_attempts'),
+    'Migration 006: email_attempts table defined'
   );
   const expectedAttemptStatuses: EmailAttemptStatus[] = [
     'attempting',
@@ -269,46 +283,46 @@ async function runStage1Verification(): Promise<void> {
     'rate_limited',
   ];
   const allAttemptStatusesPresent = expectedAttemptStatuses.every((status) =>
-    sql004.includes(`'${status}'`)
+    sql006.includes(`'${status}'`)
   );
-  assert(allAttemptStatusesPresent, 'Migration 004: All 5 attempt statuses enforced in check constraint');
+  assert(allAttemptStatusesPresent, 'Migration 006: All 5 attempt statuses enforced in check constraint');
 
   // Verify delivery_outbox table
   assert(
-    sql004.includes('CREATE TABLE IF NOT EXISTS delivery_outbox'),
-    'Migration 004: delivery_outbox table defined for transactional outbox pattern'
+    sql006.includes('CREATE TABLE IF NOT EXISTS delivery_outbox'),
+    'Migration 006: delivery_outbox table defined for transactional outbox pattern'
   );
   assert(
-    /uq_delivery_outbox_dedup\s+UNIQUE\s*\(deduplication_key\)/i.test(sql004),
-    'Migration 004: Outbox deduplication constraint uq_delivery_outbox_dedup (deduplication_key) enforced'
+    /uq_delivery_outbox_dedup\s+UNIQUE\s*\(deduplication_key\)/i.test(sql006),
+    'Migration 006: Outbox deduplication constraint uq_delivery_outbox_dedup (deduplication_key) enforced'
   );
   const expectedOutboxStatuses: OutboxStatus[] = ['pending', 'processing', 'dispatched', 'failed'];
   const allOutboxStatusesPresent = expectedOutboxStatuses.every((status) =>
-    sql004.includes(`'${status}'`)
+    sql006.includes(`'${status}'`)
   );
-  assert(allOutboxStatusesPresent, 'Migration 004: All 4 outbox statuses enforced in check constraint');
+  assert(allOutboxStatusesPresent, 'Migration 006: All 4 outbox statuses enforced in check constraint');
 
-  // Verify migration 005 historical backfill
-  const sql005Path = path.join(migrationsDir, '005_backfill_historical_deliveries.sql');
-  const sql005 = fs.readFileSync(sql005Path, 'utf8');
+  // Verify migration 007 historical backfill
+  const sql007Path = path.join(migrationsDir, '007_backfill_historical_deliveries.sql');
+  const sql007 = fs.readFileSync(sql007Path, 'utf8');
 
   assert(
-    sql005.includes('INSERT INTO email_deliveries') &&
-    sql005.includes('ON CONFLICT (campaign_id, recipient_id) DO NOTHING'),
-    'Migration 005: Idempotent backfill into email_deliveries using ON CONFLICT DO NOTHING'
+    sql007.includes('INSERT INTO email_deliveries') &&
+    sql007.includes('ON CONFLICT (campaign_id, recipient_id) DO NOTHING'),
+    'Migration 007: Idempotent backfill into email_deliveries using ON CONFLICT DO NOTHING'
   );
   assert(
-    sql005.includes("WHEN sent_log.id IS NOT NULL THEN 'sent'") &&
-    sql005.includes("WHEN failed_log.id IS NOT NULL THEN 'failed'") &&
-    sql005.includes("WHEN c.status = 'scheduled' THEN 'scheduled'") &&
-    sql005.includes("WHEN c.status = 'draft' THEN 'pending'") &&
-    sql005.includes("ELSE 'pending'"),
-    'Migration 005: Accurate historical status mapping preserves existing campaign states'
+    sql007.includes("WHEN sent_log.id IS NOT NULL THEN 'sent'") &&
+    sql007.includes("WHEN failed_log.id IS NOT NULL THEN 'failed'") &&
+    sql007.includes("WHEN c.status = 'scheduled' THEN 'scheduled'") &&
+    sql007.includes("WHEN c.status = 'draft' THEN 'pending'") &&
+    sql007.includes("ELSE 'pending'"),
+    'Migration 007: Accurate historical status mapping preserves existing campaign states'
   );
   assert(
-    sql005.includes('INSERT INTO email_attempts') &&
-    sql005.includes('ON CONFLICT (delivery_id, attempt_number) DO NOTHING'),
-    'Migration 005: Historical email_logs backfilled into email_attempts'
+    sql007.includes('INSERT INTO email_attempts') &&
+    sql007.includes('ON CONFLICT (delivery_id, attempt_number) DO NOTHING'),
+    'Migration 007: Historical email_logs backfilled into email_attempts'
   );
 
   // =========================================================================

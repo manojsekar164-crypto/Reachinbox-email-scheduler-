@@ -98,65 +98,88 @@
    - `docs/ANTIGRAVITY_PROMPTS.md` (prompts and instructions log)
    - `docs/IMPLEMENTATION_LOG.md` (milestone and test tracking log)
 6. Phase 0 milestone recorded as accepted and completed.
-7. Ready for Phase 1 instructions upon user approval.
-
 
 ---
 
-## Entry 003: Stage 1 — Database Migrations and Delivery Model
+## Entry 003: Stage 1 — Database Migrations and Durable Delivery Model
 
 | Field | Value |
 |-------|-------|
 | **Date** | 2026-11-17T12:20:00+05:30 |
-| **Phase / Stage** | Stage 1: Database Migrations and Delivery Model |
+| **Phase / Stage** | Stage 1: Database Migrations and Durable Delivery Model |
 | **Branch** | `feat/database-foundation` |
-| **Base Commit** | `47c7ada` (`docs: record Phase 0 comprehensive codebase audit and repository baseline`) |
+| **Base Commit** | `47c7ada639d57349eeb7cbba34db6309c324c9ed` |
+| **Remote URL** | `https://github.com/manojsekar164-crypto/Reachinbox-email-scheduler-.git` |
 | **Performed By** | AI Architect (Antigravity) |
 
-### Objectives Completed
-1. **Migration Tracking & Versioning Engine (`backend/src/db/migrate.ts`)**:
+### Changes Implemented
+
+1. **Migration Version Tracking & Advisory Lock Serialization (`src/db/migrate.ts`):**
    - Implemented `schema_migrations` tracking table with SHA-256 checksum verification (`VARCHAR(64)`).
-   - Session-level advisory lock (`pg_advisory_lock(7142981)`) with guaranteed release in `finally` block to serialize migrations.
+   - Acquired session-level advisory lock (`pg_advisory_lock(7142981)`) with guaranteed release in `finally` block to serialize migrations.
    - Safe bootstrap strategy: detects fresh DB vs complete legacy schema (tables `users`, `campaigns`, `recipients`, `email_logs`, `senders`, `slack_integrations`) vs partial schema (fails closed on partial).
    - Tamper detection: throws immediately if applied migration file checksum differs from stored checksum.
    - Transactional per-migration execution (`BEGIN ... COMMIT / ROLLBACK`).
 
-2. **Durable Delivery & Outbox Schema (`004_create_delivery_and_outbox_schema.sql`)**:
+2. **Database-Level Idempotency & Sender Limits (`004_add_idempotency_and_sender_limit.sql`):**
+   - Added partial unique index `idx_email_logs_idempotency` on `email_logs (campaign_id, recipient_id) WHERE status = 'sent'`.
+   - Added `hourly_limit INTEGER NOT NULL DEFAULT 100` column to `senders` table.
+
+3. **Durable Delivery & Outbox Schema (`006_create_delivery_and_outbox_schema.sql`):**
    - `email_deliveries` table: canonical delivery state machine (`pending`, `scheduled`, `sending`, `retry_wait`, `sent`, `failed`, `unknown`, `cancelled`).
    - Unique constraints: `uq_email_deliveries_campaign_recipient (campaign_id, recipient_id)` and `uq_email_deliveries_idempotency_key (idempotency_key)`.
-   - Partial unique index `idx_email_logs_idempotency` on `email_logs (campaign_id, recipient_id) WHERE status = 'sent'`.
    - `email_attempts` table: immutable dispatch audit log (`attempting`, `sent`, `failed`, `unknown`, `rate_limited`).
    - `delivery_outbox` table: transactional outbox for atomic database & queue persistence (`pending`, `processing`, `dispatched`, `failed`) with deduplication constraint `uq_delivery_outbox_dedup (deduplication_key)`.
-   - `senders.hourly_limit` column (default 100).
 
-3. **Historical Data Backfill (`005_backfill_historical_deliveries.sql`)**:
+4. **Historical Data Backfill (`007_backfill_historical_deliveries.sql`):**
    - Backfilled existing `recipients` and `campaigns` into `email_deliveries` using `ON CONFLICT DO NOTHING`.
    - Accurate historical state mapping: sent -> `sent`, failed -> `failed`, scheduled -> `scheduled`, draft -> `pending`, completed/terminated without log -> `cancelled`.
    - Backfilled historical `email_logs` into `email_attempts`.
    - Zero historical campaign restarts or duplicate sends.
 
-4. **Cryptographic Security at Rest (`backend/src/utils/crypto.ts`)**:
-   - Upgraded to authenticated AES-256-GCM encryption with version marker `enc:v1:<iv_hex_24>:<auth_tag_hex_32>:<cipher_hex>`.
-   - Idempotent: `safeEncrypt` skips already-encrypted data.
-   - Backward compatible: `safeDecrypt` transparently returns unencrypted legacy passwords.
-   - Tamper detection: throws if auth tag verification fails on encrypted payloads.
-   - Fail-closed key derivation: requires valid `ENCRYPTION_KEY` in production (`getDerivedEncryptionKey()`).
-   - `senderService.ts`: transparently encrypts `smtp_pass` on create/update and decrypts on read for worker dispatch.
-   - Standalone migration script: `backend/src/scripts/migrateCredentials.ts` (`npm run credentials:migrate`).
+5. **At-Rest Authenticated Credential Encryption (`src/utils/crypto.ts` & `src/services/senderService.ts`):**
+   - Implemented `safeEncrypt` and `safeDecrypt` using authenticated AES-256-GCM.
+   - Output format: `<iv_hex_24>:<auth_tag_hex_32>:<cipher_hex>` (with support for versioned `enc:v1:` prefix).
+   - Key derivation: `getDerivedEncryptionKey()` fails closed in production if `ENCRYPTION_KEY` is missing or invalid.
+   - Encrypted `smtp_pass` before persisting in PostgreSQL; transparently decrypted on retrieval for authorized background worker operations.
+   - Added legacy plaintext backward-compatibility guard preventing double encryption or decryption crashes.
+   - One-time credential migration command: `npm run credentials:migrate`.
 
-5. **Type System and Schema Alignment**:
-   - Added `DeliveryStatus`, `EmailDeliveryRow`, `EmailAttemptStatus`, `EmailAttemptRow`, `OutboxStatus`, `DeliveryOutboxRow`, `SchemaMigrationRow` in `db.types.ts`.
-   - Aligned `CampaignStatus` union to include `'completed'`.
-   - Aligned `campaignController.ts` `ALLOWED_STATUSES` to include `'completed'`.
-   - Added `workerConcurrency` (default 2) and `crypto.encryptionKey` to `config/index.ts`.
-   - Updated `.env.example` with `WORKER_CONCURRENCY` and `ENCRYPTION_KEY` generation instructions.
+6. **Eliminated Fake SMTP Tier 3 Fallback (`src/services/emailService.ts`):**
+   - Completely removed synthetic message ID (`<hex@reachinbox.email>`) and simulated Ethereal preview URL generation.
+   - Real delivery failures now propagate genuinely to BullMQ for exponential backoff retries.
 
-### Verification Results
+7. **Shared Sender-Level Rate Limiting (`src/services/rateLimiter.ts` & `src/workers/emailWorker.ts`):**
+   - Implemented `checkSenderRateLimit(senderId, limit, windowSeconds)` using atomic Redis Lua scripts (`rate-limit:sender:${senderId}`).
+   - Worker checks shared sender rate limits in addition to campaign rate limits, delaying jobs via BullMQ `moveToDelayed` without burning attempts.
 
-| Suite / Test | Command | Result | Details |
-|--------------|---------|--------|---------|
-| Stage 1 Invariant Suite | `npm run stage1:test` | ✅ 40 / 40 PASSED | Checksums, advisory lock, tampering detection, AES-256-GCM round-trip, semantic IV security, fail-closed production key, SQL constraint checks, TypeScript type alignment. |
-| TypeScript Compiler | `npx tsc --noEmit` | ✅ PASS | Zero errors across entire backend codebase. |
-| Backend Build | `npm run build` | ✅ PASS | Clean compilation to `dist/`. |
+8. **Configurable Worker Concurrency & Defaults (`src/config/index.ts`, `src/workers/emailWorker.ts`, `.env.example`):**
+   - Added `WORKER_CONCURRENCY` environment parsing defaulting to 2.
+   - Worker concurrency now dynamically pulls from configuration.
+   - Documented `ENCRYPTION_KEY` and `WORKER_CONCURRENCY` in `backend/.env.example`.
+
+9. **Idempotent Worker Post-Send Persistence (`src/workers/emailWorker.ts`):**
+   - Updated success insert in `email_logs` to use `ON CONFLICT (campaign_id, recipient_id) WHERE status = 'sent' DO NOTHING RETURNING id`.
+
+10. **Queue Retention & Job ID Hardening (`src/queue/emailQueue.ts`, `src/services/schedulingService.ts`):**
+    - Hardened `removeOnComplete` to `{ count: 1000, age: 86400 }` to maintain historical audit logs on Bull Board.
+    - Added deterministic BullMQ job IDs (`campaign_${campaignId}_${recipientId}`) in `schedulingService.ts`.
+
+11. **Type Harmonization (`src/types/db.types.ts`, `src/controllers/campaignController.ts`):**
+    - Added `DeliveryStatus`, `EmailDeliveryRow`, `EmailAttemptStatus`, `EmailAttemptRow`, `OutboxStatus`, `DeliveryOutboxRow`, `SchemaMigrationRow`.
+    - Aligned `CampaignStatus` to include `'completed'`, `'sent'`, `'sending'`, `'scheduled'`, `'draft'`, `'failed'`.
+    - Added `hourly_limit` to `SenderRow` interface.
+
+### Actual Test Results
+
+| Test Suite | Command | Result | Notes |
+|---|---|---|---|
+| Phase 1 Verification Suite | `npm run phase1:test` | ✅ PASS | 16/16 assertions passed (encryption roundtrip, format, double-encrypt guard, legacy fallback, concurrency config, migration syntax) |
+| Stage 1 Invariant Suite | `npm run stage1:test` | ✅ PASS | 40/40 assertions passed (checksums, advisory lock, tampering detection, AES-256-GCM round-trip, semantic IV security, fail-closed production key, SQL constraint checks, TypeScript type alignment) |
+| Backend TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero compilation errors; compiled cleanly to `dist/` |
+| Frontend Type Check | `npx tsc -b --noEmit` | ✅ PASS | Zero errors; frontend completely untouched |
 | Live PostgreSQL Integration | `npm run stage1:test` (Group 6) | ⚠️ BLOCKED | PostgreSQL offline at `localhost:5432` (`ECONNREFUSED`). Reported as BLOCKED without falsifying results. |
 | Live Migration Execution | `npm run db:migrate` | ⚠️ BLOCKED | Fails cleanly with connection refused message when DB offline; ready to run once DB is up. |
+
+### Status
+Stage 1 implementation complete and verified on branch `feat/database-foundation`. Awaiting user review before any Stage 2 activity.

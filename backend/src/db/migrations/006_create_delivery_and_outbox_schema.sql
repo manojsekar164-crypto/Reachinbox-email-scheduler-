@@ -1,5 +1,5 @@
 -- =============================================================================
--- Migration: 004_create_delivery_and_outbox_schema
+-- Migration: 006_create_delivery_and_outbox_schema
 -- Description: Creates the durable email delivery model, attempt history,
 --              transactional outbox schema, and migration tracking table.
 -- =============================================================================
@@ -14,9 +14,11 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 -- =============================================================================
 CREATE TABLE IF NOT EXISTS schema_migrations (
   filename    VARCHAR      PRIMARY KEY,
-  checksum    VARCHAR(64)  NOT NULL,
+  checksum    VARCHAR(64)  NOT NULL DEFAULT '',
   applied_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum VARCHAR(64) NOT NULL DEFAULT '';
 
 -- =============================================================================
 -- ALTER TABLE: senders
