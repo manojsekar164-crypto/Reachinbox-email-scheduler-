@@ -575,3 +575,64 @@ Awaiting explicit operator authorization.
 | Batch 1 Verification Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
 | TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
 | Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched (6 baseline tables) |
+
+
+---
+
+## [Entry 011] - 2026-11-17 - Phase 1 Batch 4: Distributed Rate Limiting and Minimum Send Spacing
+
+**Scope:** Batch 4 – Distributed Rate Limiting and Minimum Send Spacing  
+**Branch:** `feat/database-foundation`  
+**Starting Baseline Commit:** `b64a6bd`  
+**Engineer:** Senior Backend Engineer  
+
+### Implementation Summary
+
+1. **Global Hourly Limit Configuration (`src/config/index.ts`):**
+   - Added `globalHourlyLimit` to application configuration (`config.app.globalHourlyLimit`), reading from `GLOBAL_EMAILS_PER_HOUR`.
+   - Defaults to 0 (disabled), permitting unconstrained throughput when no global limit is configured.
+
+2. **Atomic Unified Rate Limit & Spacing Reservation (`src/services/rateLimiter.ts`):**
+   - Implemented `UNIFIED_RATE_LIMIT_LUA`: An atomic Redis Lua script coordinating all 4 limits in a single atomic transaction:
+     - Minimum send spacing (`rate-limit:spacing:last-send`) with configurable delay window (`ARGV[1]`).
+     - Global hourly limit (`rate-limit:global:hour`) with rolling 3600-second window.
+     - Campaign-specific hourly limit (`rate-limit:campaign:<id>:hour`) with 3600-second window.
+     - Sender-specific hourly limit (`rate-limit:sender:<id>:hour`) with 3600-second window.
+   - **Atomicity & Non-Partial Invariant:** The Lua script evaluates all conditions before consuming any quota or setting timestamps. If any single check fails (spacing, global, campaign, or sender), zero keys are incremented or touched.
+   - **Distributed Clock Synchronization:** Utilizes `redis.call('TIME')` directly on the Redis server for consistent distributed time evaluation across multiple worker processes.
+   - **Zero Limit Disabling:** Global limit of 0 disables global throttling check. Sender and campaign limits are evaluated only when active and configured > 0.
+   - Implemented `reserveSendSlot(options)` returning typed `RateLimitReservationResult` indicating whether the send slot was reserved, reason for restriction (`spacing`, `global_hourly_limit`, `campaign_hourly_limit`, `sender_hourly_limit`), and wait duration in milliseconds.
+   - Retained backward-compatible helper functions (`checkRateLimit`, `checkSenderRateLimit`, `checkGlobalRateLimit`).
+
+3. **Safe Delayed Rescheduling in Worker (`src/workers/emailWorker.ts`):**
+   - Replaced uncoordinated multi-step rate limiting and spacing checks with the unified `reserveSendSlot()` call.
+   - On limit restriction:
+     - Atomically releases the PostgreSQL delivery claim via `releaseDeliveryClaim()`, setting delivery status back to `retry_wait` and persisting `next_attempt_at = NOW() + waitMs`.
+     - Preserves existing Slack alert integration for campaign hourly rate limit exhaustion.
+     - Moves BullMQ job to delayed set using `await job.moveToDelayed(Date.now() + waitMs, token)` and throws BullMQ `DelayedError` to cleanly exit without failing the job or creating duplicate records.
+   - Survives worker crashes and restarts without re-sending or losing queue persistence.
+
+4. **Batch 4 Acceptance Test Suite (`src/scripts/testBatch4RateLimitingAndSpacing.ts`):**
+   - Implemented 10 comprehensive verification scenarios:
+     1. Unified atomic reservation across all four limits.
+     2. Zero partial increments when any limit blocks.
+     3. Minimum send spacing enforcement across concurrent workers.
+     4. Campaign hourly limit enforcement and delayed rescheduling.
+     5. Shared sender hourly limit coordination across multiple campaigns.
+     6. Global hourly limit enforcement and disablement when set to 0.
+     7. Safe release of delivery claim and transition to `retry_wait` on restriction.
+     8. Delayed job survival across worker restart with zero duplicate sends.
+     9. Slack alert preservation for campaign rate limits.
+     10. Delivery state integrity and single SMTP send verification.
+
+### Actual Test Results
+
+| Test Suite | Command | Result | Notes |
+|---|---|---|---|
+| Batch 4 Verification Suite | `npm run batch4:test` | ✅ PASS | 51/51 assertions passed across all 10 scenarios |
+| Batch 3 Regression Suite | `npm run batch3:test` | ✅ PASS | 96/96 assertions passed across all 14 scenarios |
+| Batch 2 Regression Suite | `npm run batch2:test` | ✅ PASS | 25/25 assertions passed across all 9 outbox/persistence scenarios |
+| Batch 1 Regression Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
+| TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
+| Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched |
+

@@ -1,7 +1,12 @@
 import { Worker, Job, DelayedError } from 'bullmq';
 import { emailQueueName, EmailJobPayload, redisConnectionOptions } from '../queue/emailQueue';
 import { sendEmail, SendEmailResult } from '../services/emailService';
-import { checkRateLimit, checkSenderRateLimit } from '../services/rateLimiter';
+import {
+  reserveSendSlot,
+  getGlobalHourlyLimit,
+  checkRateLimit,
+  checkSenderRateLimit,
+} from '../services/rateLimiter';
 import { handleRateLimitNotification, notifyCampaignCompleted } from '../services/slackService';
 import { indexEmailAsSent } from '../services/searchService';
 import { db as pool } from '../db/postgres';
@@ -60,6 +65,8 @@ export async function processEmailJob(
       leaseDurationMs?: number;
       onSmtpAccepted?: () => Promise<void>;
       testWindowSeconds?: number;
+      testSendDelayMs?: number;
+      testGlobalLimit?: number;
     };
     attemptsMade: number;
     opts?: { attempts?: number };
@@ -78,6 +85,8 @@ export async function processEmailJob(
     leaseDurationMs,
     onSmtpAccepted,
     testWindowSeconds,
+    testSendDelayMs,
+    testGlobalLimit,
   } = job.data;
   const attempt = job.attemptsMade + 1;
   const jobId = job.id || `direct_${Date.now()}`;
@@ -239,45 +248,54 @@ export async function processEmailJob(
     }
   }
 
-  // --- 2.6. Campaign Rate Limit Check ---
+  // --- 2.6. Unified Atomic Rate Limit & Minimum Send Spacing Reservation ---
+  const sendDelayMs =
+    testSendDelayMs !== undefined
+      ? testSendDelayMs
+      : config.app.emailSendDelayMs;
+
+  const globalLimit =
+    testGlobalLimit !== undefined
+      ? testGlobalLimit
+      : getGlobalHourlyLimit();
+
   const windowSeconds =
     testWindowSeconds ||
     (process.env['RATE_LIMIT_WINDOW_SECONDS']
       ? parseInt(process.env['RATE_LIMIT_WINDOW_SECONDS'], 10)
       : config.app.rateLimitWindow);
-  const { allowed, waitMs } = await checkRateLimit(campaignId, campaign.hourly_limit, windowSeconds);
 
-  if (!allowed) {
+  const reservation = await reserveSendSlot({
+    campaignId,
+    campaignLimit: campaign.hourly_limit,
+    senderId: sender ? sender.id : null,
+    senderLimit: sender ? sender.hourly_limit : null,
+    globalLimit,
+    windowSeconds,
+    sendDelayMs,
+  });
+
+  if (!reservation.allowed) {
+    const { waitMs, reason } = reservation;
     console.log(
-      `   ⏳ [Job ${jobId}] Rate limit reached for campaign ${campaignId}. Delaying for ${waitMs}ms`
+      `   ⏳ [Job ${jobId}] Rate limit / spacing restriction reached (${reason}). Delaying for ${waitMs}ms`
     );
-    const delayMs = Math.max(waitMs, 1000);
-    await releaseDeliveryClaim(claimedDelivery.id, 'retry_wait', delayMs, dbClient);
-    await handleRateLimitNotification(campaignId, campaign.hourly_limit, waitMs);
+
+    const effectiveDelayMs = Math.max(waitMs, reason === 'spacing' ? 10 : 1000);
+
+    // Release delivery claim safely: resets attempt_count, transitions status to retry_wait, persists next_attempt_at
+    await releaseDeliveryClaim(claimedDelivery.id, 'retry_wait', effectiveDelayMs, dbClient);
+
+    // If campaign hourly limit reached, preserve existing Slack rate-limit notification
+    if (reason === 'campaign') {
+      await handleRateLimitNotification(campaignId, campaign.hourly_limit, waitMs);
+    }
 
     if (job.moveToDelayed) {
-      await job.moveToDelayed(Date.now() + delayMs, job.token);
+      await job.moveToDelayed(Date.now() + effectiveDelayMs, job.token);
       throw new DelayedError();
     }
     return;
-  }
-
-  // --- 2.7. Shared Sender Rate Limit Check ---
-  if (sender && sender.hourly_limit && sender.hourly_limit > 0) {
-    const senderLimitCheck = await checkSenderRateLimit(sender.id, sender.hourly_limit, windowSeconds);
-    if (!senderLimitCheck.allowed) {
-      console.log(
-        `   ⏳ [Job ${jobId}] Shared sender rate limit reached for sender ${sender.id}. Delaying for ${senderLimitCheck.waitMs}ms`
-      );
-      const delayMs = Math.max(senderLimitCheck.waitMs, 1000);
-      await releaseDeliveryClaim(claimedDelivery.id, 'retry_wait', delayMs, dbClient);
-
-      if (job.moveToDelayed) {
-        await job.moveToDelayed(Date.now() + delayMs, job.token);
-        throw new DelayedError();
-      }
-      return;
-    }
   }
 
   // --- 3. Build Email Content ---
@@ -286,23 +304,7 @@ export async function processEmailJob(
   const bodyText = campaign.body.replace(/\{\{name\}\}/g, nameReplacement);
   const bodyHtml = bodyText.replace(/\n/g, '<br>');
 
-  // --- 4. Send Spacing Check ---
-  const sendDelayMs = config.app.emailSendDelayMs;
-  const { allowed: spacingAllowed, waitMs: spacingWaitMs } = await checkSendSpacing(sendDelayMs);
-
-  if (!spacingAllowed) {
-    console.log(`   [SendDelay] Email send delayed by ${spacingWaitMs}ms`);
-    const delayMs = Math.max(spacingWaitMs, 10);
-    await releaseDeliveryClaim(claimedDelivery.id, 'retry_wait', delayMs, dbClient);
-
-    if (job.moveToDelayed) {
-      await job.moveToDelayed(Date.now() + delayMs, job.token);
-      throw new DelayedError();
-    }
-    return;
-  }
-
-  // --- 5. Record Attempt Start in email_attempts ---
+  // --- 4. Record Attempt Start in email_attempts ---
   const attemptId = await recordAttemptStart(
     claimedDelivery.id,
     claimedDelivery.attempt_count,

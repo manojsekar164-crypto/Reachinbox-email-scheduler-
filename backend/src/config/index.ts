@@ -18,6 +18,12 @@ export const config = {
     isDev: (process.env['NODE_ENV'] ?? 'development') === 'development',
     isProd: process.env['NODE_ENV'] === 'production',
     rateLimitWindow: parseInt(process.env['RATE_LIMIT_WINDOW_SECONDS'] ?? '3600', 10),
+    globalHourlyLimit: (() => {
+      const val = process.env['GLOBAL_EMAILS_PER_HOUR'];
+      if (!val) return 0;
+      const parsed = parseInt(val, 10);
+      return Number.isInteger(parsed) && parsed > 0 ? parsed : 0;
+    })(),
     workerConcurrency: (() => {
       const val = process.env['WORKER_CONCURRENCY'];
       if (!val) return 2;
