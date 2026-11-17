@@ -1,14 +1,9 @@
-﻿/**
+﻿
+/**
  * src/auth/passport.ts
  *
- * Configures the Passport Google OAuth 2.0 strategy and
- * defines serialize/deserialize so Express sessions work correctly.
- *
- * SECURITY NOTES:
- *  - Only the user UUID is stored in the session – not the full user object.
- *  - Only 'openid profile email' scopes are requested from Google.
- *  - GOOGLE_CLIENT_SECRET is never logged or exposed.
- *  - Access tokens and refresh tokens are intentionally discarded.
+ * Configures optional Google OAuth 2.0 authentication.
+ * Google OAuth is enabled only when valid configuration is supplied.
  */
 
 import passport from 'passport';
@@ -26,14 +21,18 @@ import {
 } from '../services/authService';
 import { UserRow } from '../types/db.types';
 
-// ─── Serialize ────────────────────────────────────────────────────────────────
-// Store only the user UUID in the session cookie; nothing sensitive.
+// Check whether Google OAuth credentials are configured.
+export const googleOAuthConfigured =
+  Boolean(config.google.clientId.trim()) &&
+  Boolean(config.google.clientSecret.trim()) &&
+  Boolean(config.google.callbackUrl.trim());
+
+// Store only the user UUID in the session.
 passport.serializeUser((user: Express.User, done) => {
   done(null, (user as UserRow).id);
 });
 
-// ─── Deserialize ──────────────────────────────────────────────────────────────
-// On every authenticated request, load the user from PostgreSQL via their UUID.
+// Load the authenticated user from PostgreSQL.
 passport.deserializeUser(async (id: string, done) => {
   try {
     const user = await findUserById(id);
@@ -43,53 +42,51 @@ passport.deserializeUser(async (id: string, done) => {
   }
 });
 
-// ─── Google Strategy ─────────────────────────────────────────────────────────
-passport.use(
-  new GoogleStrategy(
-    {
-      clientID: config.google.clientId,
-      clientSecret: config.google.clientSecret,
-      callbackURL: config.google.callbackUrl,
-      scope: ['openid', 'profile', 'email'],
-    },
-    async (
-      _accessToken: string,
-      _refreshToken: string,
-      profile: Profile,
-      done: VerifyCallback,
-    ) => {
-      // Tokens are intentionally not logged or persisted in this phase.
-      try {
-        const googleId = profile.id;
-        const email = profile.emails?.[0]?.value ?? null;
-        const name = profile.displayName ?? null;
+// Register Google OAuth only when credentials are configured.
+if (googleOAuthConfigured) {
+  passport.use(
+    new GoogleStrategy(
+      {
+        clientID: config.google.clientId,
+        clientSecret: config.google.clientSecret,
+        callbackURL: config.google.callbackUrl,
+        scope: ['openid', 'profile', 'email'],
+      },
+      async (
+        _accessToken: string,
+        _refreshToken: string,
+        profile: Profile,
+        done: VerifyCallback,
+      ) => {
+        try {
+          const googleId = profile.id;
+          const email = profile.emails?.[0]?.value ?? null;
+          const name = profile.displayName ?? null;
 
-        if (!email) {
-          return done(
-            new Error('Google account returned no verified email address'),
-            undefined,
-          );
+          if (!email) {
+            return done(
+              new Error('Google account returned no verified email address'),
+              undefined,
+            );
+          }
+
+          let user = await findUserByGoogleId(googleId);
+
+          if (!user) {
+            user = await findUserByEmail(email);
+          }
+
+          if (!user) {
+            user = await createAuthUser(googleId, email, name);
+          }
+
+          return done(null, user);
+        } catch (err) {
+          return done(err as Error, undefined);
         }
-
-        // Step 1: find by google_id – fast path for returning users.
-        let user = await findUserByGoogleId(googleId);
-
-        // Step 2: find by email – handles accounts created before OAuth.
-        if (!user) {
-          user = await findUserByEmail(email);
-        }
-
-        // Step 3: first-time login – create the user record.
-        if (!user) {
-          user = await createAuthUser(googleId, email, name);
-        }
-
-        return done(null, user);
-      } catch (err) {
-        return done(err as Error, undefined);
-      }
-    },
-  ),
-);
+      },
+    ),
+  );
+}
 
 export default passport;

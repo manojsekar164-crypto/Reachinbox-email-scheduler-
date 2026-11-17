@@ -55,12 +55,13 @@ export const config = {
 
   // ─── Google OAuth ────────────────────────────────────────────────────────────
   google: {
-    clientId: getEnv('GOOGLE_CLIENT_ID', 'placeholder-google-client-id'),
-    clientSecret: getEnv('GOOGLE_CLIENT_SECRET', 'placeholder-google-client-secret'),
-    callbackUrl:
-      process.env['GOOGLE_CALLBACK_URL'] ??
-      'http://localhost:5001/auth/google/callback',
-  },
+  clientId: getEnv('GOOGLE_CLIENT_ID'),
+  clientSecret: getEnv('GOOGLE_CLIENT_SECRET'),
+  callbackUrl: getEnv(
+    'GOOGLE_CALLBACK_URL',
+    'http://localhost:5002/auth/google/callback',
+  ),
+},
 
   // ─── Slack OAuth ─────────────────────────────────────────────────────────────
   slack: {

@@ -1,22 +1,36 @@
+
 /**
  * src/routes/auth.ts
  *
  * Auth routes:
- *   GET  /auth/google           – start Google OAuth flow
- *   GET  /auth/google/callback  – handle Google's redirect back
- *   GET  /auth/me               – return current authenticated user
- *   POST /auth/logout           – destroy session
+ *   GET    /auth/google           - Start Google OAuth flow
+ *   GET    /auth/google/callback  - Handle Google OAuth callback
+ *   GET    /auth/failure          - Handle OAuth failure
+ *   GET    /auth/me               - Return current authenticated user
+ *   POST   /auth/logout           - Destroy session
+ *
+ * Slack OAuth:
+ *   GET    /auth/slack            - Start Slack OAuth flow
+ *   GET    /auth/slack/callback   - Handle Slack OAuth callback
+ *   GET    /auth/slack/status    - Get Slack connection status
+ *   DELETE /auth/slack           - Disconnect Slack
  */
 
-import { Router } from 'express';
-import passport from '../auth/passport';
+import { Router, type Request, type Response } from 'express';
+
+import passport, {
+  googleOAuthConfigured,
+} from '../auth/passport';
+
 import {
   getMe,
   logout,
   oauthSuccess,
   oauthFailure,
 } from '../controllers/authController';
+
 import { requireAuth } from '../middleware/requireAuth';
+
 import {
   connectSlack,
   slackCallback,
@@ -26,42 +40,113 @@ import {
 
 const router = Router();
 
-// ─── Start OAuth flow ─────────────────────────────────────────────────────────
-// Passport redirects the browser to Google's authorization endpoint.
-// The 'state' parameter (CSRF protection) is handled automatically by Passport.
-router.get(
-  '/google',
-  passport.authenticate('google', {
-    scope: ['openid', 'profile', 'email'],
-  }),
-);
+// ============================================================
+// GOOGLE OAUTH CONFIGURATION
+// ============================================================
 
-// ─── OAuth callback ───────────────────────────────────────────────────────────
-// Google redirects here after the user grants/denies consent.
-// On success: Passport calls serializeUser, writes the session, then we redirect.
-// On failure: respond with a JSON error.
-router.get(
-  '/google/callback',
-  passport.authenticate('google', {
-    failureRedirect: '/auth/failure',
-    session: true,
-  }),
-  oauthSuccess,
-);
+/**
+ * Return a clear error when Google OAuth credentials
+ * have not been configured.
+ *
+ * This allows the backend and Slack integration to operate
+ * independently of Google OAuth.
+ */
+const googleOAuthUnavailable = (
+  _req: Request,
+  res: Response,
+): void => {
+  res.status(503).json({
+    success: false,
+    message:
+      'Google OAuth is not configured. Configure GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET.',
+  });
+};
 
-// ─── OAuth failure endpoint ───────────────────────────────────────────────────
+// ============================================================
+// GOOGLE OAUTH ROUTES
+// ============================================================
+
+if (googleOAuthConfigured) {
+
+  // Start Google OAuth flow.
+  router.get(
+    '/google',
+    passport.authenticate('google', {
+      scope: ['openid', 'profile', 'email'],
+    }),
+  );
+
+  // Handle Google OAuth callback.
+  router.get(
+    '/google/callback',
+    passport.authenticate('google', {
+      failureRedirect: '/auth/failure',
+      session: true,
+    }),
+    oauthSuccess,
+  );
+
+} else {
+
+  // Google OAuth is unavailable until valid credentials exist.
+  router.get('/google', googleOAuthUnavailable);
+
+  router.get('/google/callback', googleOAuthUnavailable);
+
+}
+
+// ============================================================
+// OAUTH FAILURE ROUTE
+// ============================================================
+
 router.get('/failure', oauthFailure);
 
-// ─── Current user ─────────────────────────────────────────────────────────────
+// ============================================================
+// CURRENT AUTHENTICATED USER
+// ============================================================
+
 router.get('/me', getMe);
 
-// ─── Logout ───────────────────────────────────────────────────────────────────
+// ============================================================
+// LOGOUT
+// ============================================================
+
 router.post('/logout', logout);
 
-// ─── Slack OAuth ─────────────────────────────────────────────────────────────
-router.get('/slack', requireAuth, connectSlack);
-router.get('/slack/callback', requireAuth, slackCallback);
-router.get('/slack/status', requireAuth, getSlackStatus);
-router.delete('/slack', requireAuth, disconnectSlack);
+// ============================================================
+// SLACK OAUTH ROUTES
+// ============================================================
+
+// Start Slack OAuth authorization.
+router.get(
+  '/slack',
+  requireAuth,
+  connectSlack,
+);
+
+// Handle Slack OAuth callback.
+router.get(
+  '/slack/callback',
+  requireAuth,
+  slackCallback,
+);
+
+// Get current Slack integration status.
+router.get(
+  '/slack/status',
+  requireAuth,
+  getSlackStatus,
+);
+
+// Disconnect Slack integration.
+router.delete(
+  '/slack',
+  requireAuth,
+  disconnectSlack,
+);
+
+// ============================================================
+// EXPORT ROUTER
+// ============================================================
 
 export default router;
