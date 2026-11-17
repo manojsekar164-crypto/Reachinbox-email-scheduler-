@@ -13,6 +13,7 @@
     "phase1:test": "ts-node --transpile-only src/scripts/testPhase1Database.ts",
     "isolated-db:test": "ts-node --transpile-only src/scripts/testIsolatedMigration.ts",
     "batch1:test": "ts-node --transpile-only src/scripts/testBatch1DeliveryClaiming.ts",
+    "batch2:test": "ts-node --transpile-only src/scripts/testBatch2OutboxAndQueuePersistence.ts",
     "credentials:migrate": "ts-node --transpile-only src/scripts/migrateCredentials.ts",
     "worker": "ts-node-dev --respawn --transpile-only src/workers/emailWorker.ts",
     "queue:test": "ts-node --transpile-only src/scripts/testQueue.ts",

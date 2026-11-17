@@ -7,6 +7,7 @@ import { config } from '../config';
 export interface EmailJobPayload {
   campaignId: string;
   recipientId: string;
+  deliveryId?: string;
 }
 
 // ---------------------------------------------------------------------------

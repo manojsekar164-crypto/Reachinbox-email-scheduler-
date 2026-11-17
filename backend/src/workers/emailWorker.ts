@@ -19,6 +19,7 @@ import {
   recordAttemptFailure,
   recordAttemptUncertain,
   isUncertainSmtpError,
+  activateDueCampaign,
 } from '../services/deliveryService';
 
 /**
@@ -71,7 +72,7 @@ export async function processEmailJob(
     'SELECT * FROM campaigns WHERE id = $1',
     [campaignId]
   );
-  const campaign = campaignResult.rows[0];
+  let campaign = campaignResult.rows[0];
 
   const recipientResult = await dbClient.query<RecipientRow>(
     'SELECT * FROM recipients WHERE id = $1',
@@ -115,6 +116,22 @@ export async function processEmailJob(
   if (delivery.deleted_at !== null || delivery.status === 'cancelled') {
     console.log(`   ⏭️ [Job ${jobId}] Delivery is cancelled or soft-deleted. Skipping.`);
     return;
+  }
+
+  // --- Scheduled Campaign Check & Due Activation ---
+  if (campaign.status === 'scheduled') {
+    if (campaign.scheduled_at && new Date(campaign.scheduled_at).getTime() > Date.now()) {
+      console.log(
+        `   ⏳ [Job ${jobId}] Campaign scheduled for future (${campaign.scheduled_at}). Cannot execute before scheduled_at. Skipping.`
+      );
+      return;
+    }
+    // Campaign is due! Atomically activate it:
+    await activateDueCampaign(campaignId, dbClient);
+    const reloaded = await dbClient.query<CampaignRow>('SELECT * FROM campaigns WHERE id = $1', [campaignId]);
+    if (reloaded.rows[0]) {
+      campaign = reloaded.rows[0];
+    }
   }
 
   // Invariant 4: Campaign must be eligible (must be in 'sending' status)

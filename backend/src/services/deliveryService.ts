@@ -67,6 +67,47 @@ export function isUncertainSmtpError(error: any): boolean {
 }
 
 /**
+ * Atomically activates a due scheduled campaign:
+ * Transitions campaign status from 'scheduled' to 'sending' IF AND ONLY IF
+ * (scheduled_at IS NULL OR scheduled_at <= NOW()).
+ * Idempotent: If already 'sending' or 'completed', returns false gracefully.
+ */
+export async function activateDueCampaign(
+  campaignId: string,
+  client: Pool | PoolClient = defaultPool
+): Promise<boolean> {
+  const result = await client.query(
+    `UPDATE campaigns
+     SET status = 'sending',
+         updated_at = NOW()
+     WHERE id = $1
+       AND status = 'scheduled'
+       AND (scheduled_at IS NULL OR scheduled_at <= NOW())
+     RETURNING id`,
+    [campaignId]
+  );
+  return result.rowCount !== null && result.rowCount > 0;
+}
+
+/**
+ * Activates all scheduled campaigns that have reached their scheduled_at timestamp.
+ */
+export async function activateAllDueCampaigns(
+  client: Pool | PoolClient = defaultPool
+): Promise<number> {
+  const result = await client.query(
+    `UPDATE campaigns
+     SET status = 'sending',
+         updated_at = NOW()
+     WHERE status = 'scheduled'
+       AND scheduled_at IS NOT NULL
+       AND scheduled_at <= NOW()
+     RETURNING id`
+  );
+  return result.rowCount ?? 0;
+}
+
+/**
  * Retrieves the canonical delivery record by campaign and recipient.
  */
 export async function getDelivery(

@@ -314,3 +314,61 @@ Awaiting explicit operator authorization.
 | Phase 1 Database Test | `npm run phase1:test` | ✅ PASS | 16/16 assertions passed |
 | TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
 | Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched (6 baseline tables) |
+
+---
+
+## [Entry 006] - 2026-11-17 - Phase 1 Batch 2: Transactional Outbox and Queue Persistence
+
+**Scope:** Batch 2 – Transactional Outbox and Queue Persistence
+**Branch:** `feat/database-foundation`
+**Engineer:** Senior Backend Engineer
+
+### Implementation Summary
+
+1. **Transactional Campaign Creation (`src/services/campaignService.ts`):**
+   - Refactored `createCampaignWithRecipients()` to execute entirely within a single atomic PostgreSQL transaction (`BEGIN ... COMMIT / ROLLBACK`).
+   - Inserts `campaigns`, `recipients`, `email_deliveries`, and `delivery_outbox` within the exact same transaction block.
+   - Eliminates the database-commit-to-BullMQ-publish failure gap: if any operation fails, all records roll back completely with zero orphaned partial state.
+   - Outbox event payload encodes delivery ID, campaign ID, recipient ID, and scheduled timestamp.
+   - Immediate asynchronous sweep triggers publisher processing without waiting for polling loops.
+
+2. **Reliable Outbox Publisher (`src/services/outboxPublisher.ts`):**
+   - Dedicated outbox publisher using PostgreSQL `FOR UPDATE SKIP LOCKED` and `UPDATE ... RETURNING`.
+   - Records publisher claim ownership (`claim_owner`) and lease expiry (`lease_expires_at`).
+   - Leases expire automatically after a configurable duration (default 30 seconds), enabling crash recovery.
+   - Publishes jobs to BullMQ queue using delivery IDs and deterministic deduplication keys (`campaign_<campaignId>_<recipientId>`).
+   - Marks outbox records as `dispatched` with timestamp only AFTER successful BullMQ job creation (`markOutboxDispatched`).
+   - Marks outbox records as `failed` if an error occurs during publication, incrementing attempt counts.
+   - Re-entrancy and sweep idempotency: already dispatched events are completely ignored on repeated sweeps or publisher restarts.
+
+3. **Future Scheduled Deliveries & Queue Persistence:**
+   - Preserves exact PostgreSQL `scheduled_at` timestamp.
+   - Publishes future scheduled deliveries to BullMQ with `delay = Math.max(0, scheduledAt.getTime() - Date.now())`.
+   - Worker checks scheduled timestamp: if `scheduled_at > NOW()`, refuses early execution and skips cleanly.
+   - At due time (`scheduled_at <= NOW()`), atomically activates campaign from `scheduled` to `sending` via `activateDueCampaign()` and claims delivery via `claimDelivery()`.
+   - Outbox recovery reconciliation (`recoverFutureScheduledDeliveries()`): scans for future scheduled deliveries missing outbox records and recovers them into the outbox.
+   - Safety guard: NEVER creates recovery records for `sent`, `cancelled`, `unknown`, `failed`, or `draft` deliveries.
+
+4. **Integration Test Suite (`src/scripts/testBatch2OutboxAndQueuePersistence.ts`):**
+   - Implemented real integration tests covering all 9 required verification scenarios against ephemeral PostgreSQL DB `reachinbox_migration_test`:
+     1. Transaction failure atomicity (recipient, delivery, or outbox failure triggers total rollback).
+     2. Concurrent publishers claiming outbox records (`FOR UPDATE SKIP LOCKED` yields disjoint sets with zero overlap).
+     3. Expired publisher lease recovery (expired lease claimed by new publisher, claim owner reassigned).
+     4. Publisher crash after `queue.add` but before outbox update (authoritative PostgreSQL state prevents duplicate delivery).
+     5. Repeated publication after restart (sweep idempotency, zero duplicate jobs).
+     6. Completed BullMQ job removal (`removeOnComplete: true`) followed by recovery (database state prevents duplicate send).
+     7. Future scheduled delivery publishing (exact delay preserved, worker refuses early execution, succeeds at due time).
+     8. Reconcile future scheduled deliveries without outbox records (legitimate future deliveries safely recovered).
+     9. Sent, cancelled, unknown, failed, or draft deliveries are NEVER replayed (zero recovery outbox records).
+
+### Actual Test Results
+
+| Test Suite | Command | Result | Notes |
+|---|---|---|---|
+| Batch 2 Verification Suite | `npm run batch2:test` | ✅ PASS | 25/25 assertions passed across all 9 scenarios |
+| Batch 1 Verification Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
+| Isolated DB Migration Suite | `npm run isolated-db:test` | ✅ PASS | 31/31 assertions passed on real ephemeral PostgreSQL |
+| Stage 1 Invariant Suite | `npm run stage1:test` | ✅ PASS | 49/49 assertions passed |
+| Phase 1 Database Test | `npm run phase1:test` | ✅ PASS | 16/16 assertions passed |
+| TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
+| Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched (6 baseline tables) |

@@ -17,10 +17,12 @@ import { db } from '../db/postgres';
 import { indexScheduledEmails } from './searchService';
 import { scheduleEmailJobs } from './schedulingService';
 import { notifyCampaignCreated } from './slackService';
+import { processOutboxBatch } from './outboxPublisher';
 import {
   CampaignRow,
   CampaignStatus,
   RecipientRow,
+  EmailDeliveryRow,
 } from '../types/db.types';
 
 // =============================================================================
@@ -108,6 +110,61 @@ export async function createCampaignWithRecipients(
       recipients.push(recipientRows[0]!);
     }
 
+    // 3. Atomically create email_deliveries and delivery_outbox events in the SAME transaction
+    for (const recipient of recipients) {
+      const idempotencyKey = `campaign_${campaign.id}_${recipient.id}`;
+      const deliveryStatus = input.scheduledAt ? 'scheduled' : 'pending';
+
+      const { rows: deliveryRows } = await client.query<EmailDeliveryRow>(
+        `INSERT INTO email_deliveries (
+           campaign_id,
+           recipient_id,
+           sender_id,
+           idempotency_key,
+           status,
+           scheduled_at,
+           created_at,
+           updated_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+         RETURNING *`,
+        [
+          campaign.id,
+          recipient.id,
+          input.senderId ?? null,
+          idempotencyKey,
+          deliveryStatus,
+          input.scheduledAt ?? null,
+        ]
+      );
+      const delivery = deliveryRows[0]!;
+
+      // Insert transactional outbox event for reliable queue publication
+      await client.query(
+        `INSERT INTO delivery_outbox (
+           event_type,
+           aggregate_id,
+           deduplication_key,
+           payload,
+           status,
+           available_at,
+           created_at
+         )
+         VALUES ($1, $2, $3, $4, 'pending', NOW(), NOW())`,
+        [
+          'email.dispatch',
+          delivery.id,
+          idempotencyKey,
+          JSON.stringify({
+            deliveryId: delivery.id,
+            campaignId: campaign.id,
+            recipientId: recipient.id,
+            scheduledAt: input.scheduledAt ? input.scheduledAt.toISOString() : null,
+          }),
+        ]
+      );
+    }
+
     await client.query('COMMIT');
 
     // Index the scheduled emails in Elasticsearch (safely, catching all errors)
@@ -117,15 +174,11 @@ export async function createCampaignWithRecipients(
       console.error(`❌ [Elasticsearch] Scheduled email indexing failed: ${esErr.message}`);
     }
 
-    // Enqueue BullMQ delayed jobs for each recipient (Phase 9E).
-    // Errors here are logged but do NOT throw — the campaign is already committed
-    // in PostgreSQL and must not be rolled back due to a transient queue error.
+    // Process transactional outbox to publish BullMQ jobs immediately after commit
     try {
-      await scheduleEmailJobs(campaign, recipients);
-    } catch (queueErr: any) {
-      console.error(
-        `❌ [Scheduler] Failed to enqueue jobs for campaign ${campaign.id}: ${queueErr.message}`,
-      );
+      await processOutboxBatch();
+    } catch (pubErr: any) {
+      console.warn(`⚠️ [OutboxPublisher] Immediate publication failed, will be retried by poller: ${pubErr.message}`);
     }
 
     // Trigger Slack notification for campaign launch (isolated and non-blocking)
