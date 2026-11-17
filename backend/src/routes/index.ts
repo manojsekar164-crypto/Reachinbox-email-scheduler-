@@ -6,6 +6,7 @@ import emailRouter from './emails';
 import senderRouter from './senders';
 import preflightRouter from './preflight';
 import deliveriesRouter from './deliveries';
+import copilotRouter from './copilot';
 import { queuesDashboardRouter } from './queues';
 
 const router = Router();
@@ -18,6 +19,7 @@ router.use('/emails', emailRouter);
 router.use('/senders', senderRouter);
 router.use('/preflight', preflightRouter);
 router.use('/deliveries', deliveriesRouter);
+router.use('/copilot', copilotRouter);
 
 // Expose Bull Board dashboard at /admin/queues (development only)
 router.use('/admin/queues', queuesDashboardRouter);

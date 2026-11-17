@@ -11,3 +11,5 @@ export * from './slackService';
 export * from './sendSpacing';
 export * from './recoveryService';
 export * from './operationsIntelligenceService';
+export * from './llmProvider';
+export * from './copilotService';

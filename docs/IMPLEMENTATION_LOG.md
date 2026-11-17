@@ -1072,3 +1072,63 @@ Protect shared global rate-limit telemetry and system-wide throughput metrics ex
 | Batch 1 Regression Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
 | TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
 | Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched |
+
+---
+
+## 2026-11-17 – Entry 020: Batch 7B – AI Delivery Operations Copilot
+
+### Scope & Objective
+Implement a real AI-powered Delivery Operations Copilot using the verified Operations Intelligence Data Service from Batch 7A:
+1. **Authenticated REST Endpoint (`POST /copilot/chat`)**:
+   - Accepts `{ question, context? }` with strict session authentication (`requireAuth`).
+   - Extracts user ID exclusively from authenticated session middleware (`req.user.id`).
+   - Explicitly rejects client-supplied `user_id` or `userId` in request body or headers with HTTP 400.
+   - Enforces 32KB payload boundary with HTTP 413.
+   - Returns structured, typed response `{ success, answer, insights, recommendations, sources, generated_at, data_freshness }`.
+2. **Operations Intelligence Integration**:
+   - Grounded directly on real ReachInbox operational data via `getOperationsContext(userId, context)`.
+   - Answers operational inquiries across campaigns, delivery failures, senders, queues, bottlenecks, and unknown outcomes.
+   - Citations backed by authoritative `sources` array with valid source entity IDs (`campaign:<id>`, `sender:<id>`, `delivery:<id>`, etc.).
+3. **Pluggable Multi-Provider Architecture (`ILLMProvider`)**:
+   - Provider abstraction supporting `openai`, `anthropic`, `gemini`, and deterministic `mock` provider.
+   - Graceful fallback: unconfigured runtime throws `CopilotConfigError` (HTTP 503) without crashing or querying DB/Redis.
+   - Transparent error handling: invalid provider credentials return HTTP 503, provider timeouts return HTTP 504, upstream errors return HTTP 502.
+4. **Grounded Prompt Engineering & Anti-Injection**:
+   - System prompt instructs LLM strictly to use operational context data enclosed in `<retrieved_operational_context>`.
+   - Rigorously separates observed operational facts from operational recommendations.
+   - Strictly enforces RFC 5321 SMTP acceptance (250 OK) vs inbox placement distinction.
+   - Immune to prompt injection: treats user question as untrusted data in `<user_question>`, ignoring instructions to alter system persona, bypass rules, or execute state mutations.
+5. **Strict Read-Only & Zero Database/Queue Mutations**:
+   - AI assistant executes strictly read-only workflows: zero updates to `campaigns`, `email_deliveries`, `email_attempts`, or outbox.
+   - Never exposes SQL execution interface or query construction capabilities to the LLM.
+6. **Privacy, Security & Tenant Isolation**:
+   - Zero credential leaks: SMTP passwords, OAuth tokens, and secret keys excluded from LLM context.
+   - Minimal PII: no recipient names or emails in operational context.
+   - Shared rate-limit telemetry strictly respects Batch 7A.2 privacy invariants.
+   - Enforces Redis per-user rate limit (20 req/min per user).
+
+### Key Files Created & Modified
+1. `backend/src/types/copilot.types.ts`: Type definitions for chat requests, responses, context, LLM message contracts, provider options, and custom error classes (`CopilotValidationError`, `CopilotAuthError`, `CopilotRateLimitError`, `CopilotConfigError`, `CopilotProviderAuthError`, `CopilotTimeoutError`, `CopilotProviderError`).
+2. `backend/src/services/llmProvider.ts`: Implementation of `OpenAIProvider`, `AnthropicProvider`, `GeminiProvider`, `MockLLMProvider`, `UnconfiguredProvider`, and factory `getLLMProvider()`.
+3. `backend/src/services/copilotService.ts`: Core orchestration service implementing `handleCopilotChat()`, prompt synthesis, Redis per-user rate limiting, context retrieval, error translation, and response validation.
+4. `backend/src/controllers/copilotController.ts`: `copilotChatHandler()` enforcing session auth, payload bounds, user ID injection protection, and status code mapping.
+5. `backend/src/routes/copilot.ts`: Router mounting `POST /chat` behind `requireAuth`.
+6. `backend/src/routes/index.ts`: Registered `/copilot` in central router.
+7. `backend/src/services/index.ts`: Exported `llmProvider` and `copilotService`.
+8. `backend/package.json`: Registered `"batch7b:test"` script.
+9. `backend/src/scripts/testBatch7BCopilot.ts`: Verification suite covering all 17 scenarios and 63 assertions.
+
+### Actual Test Results
+
+| Test Suite | Command | Result | Notes |
+|---|---|---|---|
+| Batch 7B Verification Suite | `npm run batch7b:test` | ✅ PASS | 63/63 assertions passed across all 17 test scenarios |
+| Batch 7A & 7A.2 Verification Suite | `npm run batch7a:test` | ✅ PASS | 119/119 assertions passed across all 16 test scenarios |
+| Batch 6 & 6.1 Verification Suite | `npm run batch6:test` | ✅ PASS | 108/108 assertions passed across all 19 test scenarios |
+| Batch 5 Verification Suite | `npm run batch5:test` | ✅ PASS | 142/142 assertions passed across all 21 test sections |
+| Batch 4 Regression Suite | `npm run batch4:test` | ✅ PASS | 51/51 assertions passed across all 10 scenarios |
+| Batch 3 Regression Suite | `npm run batch3:test` | ✅ PASS | 96/96 assertions passed across all 14 scenarios |
+| Batch 2 Regression Suite | `npm run batch2:test` | ✅ PASS | 25/25 assertions passed across all 9 outbox/persistence scenarios |
+| Batch 1 Regression Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
+| TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
+| Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched |
