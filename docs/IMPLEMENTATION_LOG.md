@@ -636,7 +636,6 @@ Awaiting explicit operator authorization.
 | TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
 | Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched |
 
-
 ---
 
 ## [Entry 012] - 2026-11-17 - Phase 1 Batch 5: Smart Campaign Preflight (Backend Only)
@@ -692,7 +691,6 @@ Awaiting explicit operator authorization.
 | TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
 | Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched |
 
-
 ---
 
 ## [Entry 013] - 2026-11-17 - Phase 1 Batch 5.1: Preflight Forecast Accuracy
@@ -736,6 +734,61 @@ Awaiting explicit operator authorization.
 | Test Suite | Command | Result | Notes |
 |---|---|---|---|
 | Batch 5.1 Verification Suite | `npm run batch5:test` | ✅ PASS | 115/115 assertions passed across all 20 test sections |
+| Batch 4 Regression Suite | `npm run batch4:test` | ✅ PASS | 51/51 assertions passed across all 10 scenarios |
+| Batch 3 Regression Suite | `npm run batch3:test` | ✅ PASS | 96/96 assertions passed across all 14 scenarios |
+| Batch 2 Regression Suite | `npm run batch2:test` | ✅ PASS | 25/25 assertions passed across all 9 outbox/persistence scenarios |
+| Batch 1 Regression Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
+| TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
+| Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched |
+
+---
+
+## [Entry 014] - 2026-11-17 - Phase 1 Batch 5.2: Correct What-If Forecast Simulation
+
+**Scope:** Batch 5.2 – Correct What-If Forecast Simulation & Bottleneck Calculation
+**Branch:** `feat/database-foundation`
+**Starting Baseline Commit:** `4b6e2e6`
+**Engineer:** Senior Backend Engineer
+
+### Implementation Summary
+
+1. **Independent Simulated Campaign Remaining Capacity:**
+   - In `src/services/preflightService.ts`, calculated simulated campaign remaining capacity directly as `Math.max(0, hourlyLimit - campaignUsed)`.
+   - Prevented false capping where exhausted actual campaign capacity previously collapsed the simulation to 0 even if a higher simulated limit was specified.
+   - Bounded simulated capacity at zero when the simulated limit is less than or equal to already consumed campaign usage.
+
+2. **Accurate Simulated Window Capacity Comparison:**
+   - Compared `simulatedCampaignRemaining` against actual sender and global remaining capacity:
+     `simulatedCurrentHourRemaining = Math.max(0, Math.min(...simHourLimits))`.
+   - Exposed `simulated_campaign_remaining` and `simulated_current_hour_remaining` in `WhatIfScenarioResult`.
+
+3. **Independent Simulated Rate and Bottleneck Analysis:**
+   - Evaluated simulated hourly rates independently across simulated campaign limit, sender limit, global limit, and minimum spacing rate.
+   - Accurately identifies `primary_bottleneck` for the simulation (e.g. sender limit or global limit becoming the bottleneck when campaign limit is simulated higher).
+
+4. **Independent Reset-Wait Evaluation:**
+   - Evaluated `calculateResetWait()` independently with the simulated campaign capacity rather than reusing actual scenario reset waits.
+   - Prevents multi-hour delay forecasts when an increased simulated limit eliminates the campaign bottleneck, while computing appropriate reset wait when the simulated scenario itself is exhausted.
+
+5. **Read-Only Invariant & Configured State Protection:**
+   - Guaranteed 100% read-only simulation: zero Redis quota reservations and zero PostgreSQL modifications.
+   - Actual configured campaign capacity, effective hourly rate, primary bottleneck, and primary forecast remain completely untouched across all simulations.
+
+6. **Batch 5.2 Acceptance Tests (`src/scripts/testBatch5Preflight.ts`):**
+   - Added Test Section 21 asserting all required scenarios:
+     - Scenario A: Simulated limit higher than actual limit (campaign limit 35, usage 30; simulate 50 -> remaining 20, spacing duration 18s).
+     - Scenario B: Simulated limit lower than already-consumed usage (usage 30; simulate 25 -> remaining bounded at 0, requires reset wait >= 1800s).
+     - Scenario C: Simulated limit lower than actual configured limit but still available (usage 10; simulate 25 -> remaining 15, bottleneck `campaign_hourly_limit`).
+     - Scenario D: Sender limit becomes simulated bottleneck (sender limit 85; simulate 150 -> effective rate 85, bottleneck `sender_hourly_limit`).
+     - Scenario E: Global limit becomes simulated bottleneck (global limit 40; simulate 100 -> effective rate 40, bottleneck `global_hourly_limit`).
+     - Scenario F: Actual forecast remains unchanged across all simulations (limit 35, rate 35, bottleneck `campaign_hourly_limit`).
+     - Read-only verification: confirmed rate-limit keys were neither created nor mutated.
+
+### Actual Test Results
+
+| Test Suite | Command | Result | Notes |
+|---|---|---|---|
+| Batch 5 Verification Suite | `npm run batch5:test` | ✅ PASS | 142/142 assertions passed across all 21 test sections |
 | Batch 4 Regression Suite | `npm run batch4:test` | ✅ PASS | 51/51 assertions passed across all 10 scenarios |
 | Batch 3 Regression Suite | `npm run batch3:test` | ✅ PASS | 96/96 assertions passed across all 14 scenarios |
 | Batch 2 Regression Suite | `npm run batch2:test` | ✅ PASS | 25/25 assertions passed across all 9 outbox/persistence scenarios |

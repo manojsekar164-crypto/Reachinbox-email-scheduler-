@@ -818,7 +818,7 @@ export async function calculateCapacityAndForecast(
     warnings,
   };
 
-  // 10. Separate What-If Scenario Calculation (Bug 1 Fix)
+  // 10. Separate What-If Scenario Calculation (Batch 5.2 Fix)
   let whatIfScenario: WhatIfScenarioResult | null = null;
   if (
     isExistingCampaign &&
@@ -827,6 +827,17 @@ export async function calculateCapacityAndForecast(
     hourlyLimit > 0 &&
     hourlyLimit !== campaignLimit
   ) {
+    // 1. Calculate simulated campaign remaining capacity bounded at zero
+    const simulatedCampaignRemaining = Math.max(0, hourlyLimit - campaignUsed);
+
+    // 2. Compare simulated campaign capacity against actual sender and global remaining capacity
+    const simHourLimits = [simulatedCampaignRemaining, senderRemaining];
+    if (globalEnabled && globalRemaining !== null) {
+      simHourLimits.push(globalRemaining);
+    }
+    const simulatedCurrentHourRemaining = Math.max(0, Math.min(...simHourLimits));
+
+    // 3. Calculate simulated effective rate and bottleneck independently
     const simRates: Array<{ rate: number; reason: BottleneckReason }> = [
       { rate: hourlyLimit, reason: 'campaign_hourly_limit' },
       { rate: senderLimit, reason: 'sender_hourly_limit' },
@@ -839,29 +850,37 @@ export async function calculateCapacityAndForecast(
     const simEffectiveRate = simRates[0]!.rate;
     const simBottleneck = simRates[0]!.reason;
 
+    // 4. Do not reuse actual campaign exhaustion or reset-wait assumptions when they differ
+    const simResetWaitInfo = calculateResetWait(simulatedCurrentHourRemaining, N, {
+      campaign: { remaining: simulatedCampaignRemaining, ttlSeconds: campaignTtlSeconds },
+      sender: { remaining: senderRemaining, ttlSeconds: senderTtlSeconds },
+      global: { enabled: globalEnabled, remaining: globalRemaining, ttlSeconds: globalTtlSeconds },
+    });
+
     let simDurationMs = 0;
     if (N > 0) {
       const spacingDurationMs = (N - 1) * sendDelayMs;
-      const simHourRemaining = Math.min(hourlyLimit, currentHourRemaining);
       let simRateDurationMs = 0;
 
-      if (simHourRemaining <= 0) {
+      if (simulatedCurrentHourRemaining <= 0) {
         const fullHours = Math.floor((N - 1) / simEffectiveRate);
         const rem = (N - 1) % simEffectiveRate;
-        simRateDurationMs = resetWaitInfo.resetWaitMs + fullHours * 3600000 + rem * sendDelayMs;
-      } else if (N <= simHourRemaining) {
+        simRateDurationMs = simResetWaitInfo.resetWaitMs + fullHours * 3600000 + rem * sendDelayMs;
+      } else if (N <= simulatedCurrentHourRemaining) {
         simRateDurationMs = spacingDurationMs;
       } else {
-        const spillover = N - simHourRemaining;
+        const spillover = N - simulatedCurrentHourRemaining;
         const fullHours = Math.floor((spillover - 1) / simEffectiveRate);
         const rem = ((spillover - 1) % simEffectiveRate) + 1;
-        simRateDurationMs = resetWaitInfo.resetWaitMs + fullHours * 3600000 + (rem - 1) * sendDelayMs;
+        simRateDurationMs = simResetWaitInfo.resetWaitMs + fullHours * 3600000 + (rem - 1) * sendDelayMs;
       }
       simDurationMs = Math.max(spacingDurationMs, simRateDurationMs) + queuedJobsCount * sendDelayMs;
     }
 
     whatIfScenario = {
       simulated_hourly_limit: hourlyLimit,
+      simulated_campaign_remaining: simulatedCampaignRemaining,
+      simulated_current_hour_remaining: simulatedCurrentHourRemaining,
       effective_hourly_rate: simEffectiveRate,
       primary_bottleneck: simBottleneck,
       estimated_duration_seconds: Math.ceil(simDurationMs / 1000),
@@ -926,6 +945,11 @@ export async function runPreflight(
   );
 
   // 3. Sender Capacity & Forecast Engine
+  const effectiveRecipientCount =
+    input.recipientCount !== undefined && input.recipientCount >= 0
+      ? input.recipientCount
+      : validation.counts.valid_count;
+
   const { capacity, forecast, whatIfScenario } = await calculateCapacityAndForecast(
     {
       userId,
@@ -933,7 +957,7 @@ export async function runPreflight(
       campaignId,
       hourlyLimit,
       scheduledAt,
-      recipientCount: validation.counts.valid_count,
+      recipientCount: effectiveRecipientCount,
     },
     dbClient,
     redisClient

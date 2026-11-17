@@ -1035,6 +1035,222 @@ another_bad@,Bad 2`;
         'API does not make unsupported full RFC 5322 compliance claims'
       );
 
+      // ---------------------------------------------------------------------
+      // TEST 21: Correct What-If Forecast Simulation (Batch 5.2)
+      // ---------------------------------------------------------------------
+      console.log('\n' + SUB_SEP);
+      console.log('TEST 21: Correct What-If Forecast Simulation (Batch 5.2)');
+      console.log(SUB_SEP);
+
+      // Clean rate-limit keys
+      await redis.del(`rate-limit:campaign:${campaignAId}`);
+      await redis.del(`rate-limit:sender:${senderAId}`);
+      await redis.del('rate-limit:global');
+      delete process.env.GLOBAL_EMAILS_PER_HOUR;
+
+      // 1. Scenario A: Simulated limit higher than actual limit
+      // Actual campaign limit = 35. Usage = 30. Remaining = 5.
+      // Sender limit = 85. Usage = 0. Remaining = 85.
+      await redis.set(`rate-limit:campaign:${campaignAId}`, '30', 'EX', 1800);
+      const resScenarioA = await runPreflight(
+        {
+          userId: userAId,
+          campaignId: campaignAId,
+          senderId: senderAId,
+          hourlyLimit: 50, // Simulated limit higher than actual 35
+          recipientCount: 10,
+        },
+        testClient,
+        redis
+      );
+
+      assert(
+        resScenarioA.capacity.campaign.hourly_limit === 35,
+        'Scenario A: Actual campaign limit remains 35'
+      );
+      assert(
+        resScenarioA.capacity.campaign.remaining_hourly === 5,
+        'Scenario A: Actual campaign remaining remains 5'
+      );
+      assert(
+        resScenarioA.what_if_scenario !== null,
+        'Scenario A: What-if scenario is present'
+      );
+      assert(
+        resScenarioA.what_if_scenario?.simulated_hourly_limit === 50,
+        'Scenario A: Simulated hourly limit is 50'
+      );
+      assert(
+        resScenarioA.what_if_scenario?.simulated_campaign_remaining === 20,
+        'Scenario A: Simulated campaign remaining is 20 (50 - 30)'
+      );
+      assert(
+        resScenarioA.what_if_scenario?.simulated_current_hour_remaining === 20,
+        'Scenario A: Simulated current hour remaining is 20 (min(20, 85))'
+      );
+      // For recipientCount = 10:
+      // In actual scenario: 5 remaining in hour, 10 recipients => 5 spillover => needs reset wait (1800s)
+      assert(
+        resScenarioA.forecast.estimated_duration_seconds >= 1800,
+        'Scenario A: Actual forecast requires reset wait due to spillover (5 remaining < 10)'
+      );
+      // In what-if scenario: 20 remaining in hour, 10 recipients <= 20 => no spillover => spacing only ((10 - 1) * 2 = 18s)
+      assert(
+        resScenarioA.what_if_scenario?.estimated_duration_seconds === 18,
+        'Scenario A: Simulated duration is spacing-only (18s) because simulated remaining (20) >= 10'
+      );
+
+      // 2. Scenario B: Simulated limit lower than already-consumed campaign usage
+      // Usage = 30. Simulated limit = 25.
+      const resScenarioB = await runPreflight(
+        {
+          userId: userAId,
+          campaignId: campaignAId,
+          senderId: senderAId,
+          hourlyLimit: 25, // Lower than 30 consumed
+          recipientCount: 5,
+        },
+        testClient,
+        redis
+      );
+
+      assert(
+        resScenarioB.what_if_scenario !== null,
+        'Scenario B: What-if scenario is present'
+      );
+      assert(
+        resScenarioB.what_if_scenario?.simulated_campaign_remaining === 0,
+        'Scenario B: Simulated campaign remaining bounded at zero (25 - 30 <= 0)'
+      );
+      assert(
+        resScenarioB.what_if_scenario?.simulated_current_hour_remaining === 0,
+        'Scenario B: Simulated current hour remaining is 0'
+      );
+      assert(
+        resScenarioB.what_if_scenario?.estimated_duration_seconds !== undefined &&
+          resScenarioB.what_if_scenario?.estimated_duration_seconds >= 1800,
+        'Scenario B: Simulated scenario requires reset wait when simulated limit is exhausted'
+      );
+
+      // 3. Scenario C: Simulated limit lower than actual limit but still available
+      // Usage = 10 (actual limit = 35). Simulated limit = 25.
+      await redis.set(`rate-limit:campaign:${campaignAId}`, '10', 'EX', 1200);
+      const resScenarioC = await runPreflight(
+        {
+          userId: userAId,
+          campaignId: campaignAId,
+          senderId: senderAId,
+          hourlyLimit: 25, // Lower than 35, but higher than 10 used
+          recipientCount: 5,
+        },
+        testClient,
+        redis
+      );
+
+      assert(
+        resScenarioC.what_if_scenario?.simulated_campaign_remaining === 15,
+        'Scenario C: Simulated campaign remaining is 15 (25 - 10)'
+      );
+      assert(
+        resScenarioC.what_if_scenario?.simulated_current_hour_remaining === 15,
+        'Scenario C: Simulated current hour remaining is 15'
+      );
+      assert(
+        resScenarioC.what_if_scenario?.effective_hourly_rate === 25,
+        'Scenario C: Simulated effective rate is 25'
+      );
+      assert(
+        resScenarioC.what_if_scenario?.primary_bottleneck === 'campaign_hourly_limit',
+        'Scenario C: Simulated primary bottleneck is campaign_hourly_limit'
+      );
+
+      // 4. Scenario D: Sender limit becomes the simulated bottleneck
+      // Actual campaign limit = 35. Sender limit = 85.
+      // Usage: campaign = 0, sender = 60 (remaining = 25).
+      await redis.del(`rate-limit:campaign:${campaignAId}`);
+      await redis.set(`rate-limit:sender:${senderAId}`, '60', 'EX', 900);
+      const resScenarioD = await runPreflight(
+        {
+          userId: userAId,
+          campaignId: campaignAId,
+          senderId: senderAId,
+          hourlyLimit: 150, // Simulated campaign limit (150) exceeds sender limit (85)
+          recipientCount: 10,
+        },
+        testClient,
+        redis
+      );
+
+      assert(
+        resScenarioD.capacity.primary_bottleneck === 'campaign_hourly_limit',
+        'Scenario D: Actual bottleneck is campaign_hourly_limit (35 < 85)'
+      );
+      assert(
+        resScenarioD.what_if_scenario?.primary_bottleneck === 'sender_hourly_limit',
+        'Scenario D: Sender limit becomes simulated bottleneck (85 < 150)'
+      );
+      assert(
+        resScenarioD.what_if_scenario?.effective_hourly_rate === 85,
+        'Scenario D: Simulated effective rate is 85'
+      );
+      assert(
+        resScenarioD.what_if_scenario?.simulated_current_hour_remaining === 25,
+        'Scenario D: Simulated current hour remaining is capped by sender remaining (25)'
+      );
+
+      // 5. Scenario E: Global limit becomes the simulated bottleneck
+      process.env.GLOBAL_EMAILS_PER_HOUR = '40';
+      await redis.del(`rate-limit:campaign:${campaignAId}`);
+      await redis.del(`rate-limit:sender:${senderAId}`);
+      const resScenarioE = await runPreflight(
+        {
+          userId: userAId,
+          campaignId: campaignAId,
+          senderId: senderAId,
+          hourlyLimit: 100, // Campaign 100, Sender 85, Global 40
+          recipientCount: 10,
+        },
+        testClient,
+        redis
+      );
+
+      assert(
+        resScenarioE.what_if_scenario?.primary_bottleneck === 'global_hourly_limit',
+        'Scenario E: Global limit becomes simulated bottleneck (40 < 85 and 40 < 100)'
+      );
+      assert(
+        resScenarioE.what_if_scenario?.effective_hourly_rate === 40,
+        'Scenario E: Simulated effective rate is 40'
+      );
+      delete process.env.GLOBAL_EMAILS_PER_HOUR;
+
+      // 6. Scenario F: Actual forecast remains unchanged across all simulations
+      assert(
+        resScenarioE.capacity.campaign.hourly_limit === 35,
+        'Scenario F: Actual campaign hourly limit remains 35'
+      );
+      assert(
+        resScenarioE.capacity.effective_hourly_rate === 35,
+        'Scenario F: Actual effective rate remains 35'
+      );
+      assert(
+        resScenarioE.capacity.primary_bottleneck === 'campaign_hourly_limit',
+        'Scenario F: Actual capacity primary bottleneck remains campaign_hourly_limit'
+      );
+      // In Scenario E, 10 recipients with spacing of 2s = 18s (fits within actual 35 remaining)
+      assert(
+        resScenarioE.forecast.estimated_duration_seconds === 18,
+        'Scenario F: Actual forecast duration remains 18s (unaffected by simulation)'
+      );
+
+      // Verify read-only: no Redis quota was reserved, DB unchanged
+      const campTtl = await redis.ttl(`rate-limit:campaign:${campaignAId}`);
+      const senderTtl = await redis.ttl(`rate-limit:sender:${senderAId}`);
+      assert(
+        campTtl === -2 && senderTtl === -2,
+        'What-if simulations did not create or mutate rate-limit reservation keys'
+      );
+
     } finally {
       testClient.release();
       await testPool.end();

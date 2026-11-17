@@ -112,6 +112,8 @@ export interface DeliveryForecastResult {
 
 export interface WhatIfScenarioResult {
   simulated_hourly_limit: number;
+  simulated_campaign_remaining: number;
+  simulated_current_hour_remaining: number;
   effective_hourly_rate: number;
   primary_bottleneck: BottleneckReason;
   estimated_duration_seconds: number;
@@ -139,5 +141,6 @@ export interface RunPreflightInput {
   scheduledAt?: string | Date | null;
   content?: string;
   recipients?: RecipientInputItem[];
+  recipientCount?: number;
   maxUploadSizeBytes?: number;
 }
