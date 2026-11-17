@@ -1132,3 +1132,64 @@ Implement a real AI-powered Delivery Operations Copilot using the verified Opera
 | Batch 1 Regression Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
 | TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
 | Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched |
+
+---
+
+## 2026-11-18 – Entry 021: Batch 8 – Bull Board Security & Admin Access
+
+### Scope & Objective
+Secure the existing Bull Board dashboard at `/admin/queues` with robust session authentication and environment-configured admin-only authorization:
+1. **Inspection & Role Architecture Evaluation**:
+   - Inspected existing authentication middleware (`requireAuth.ts`) and user schema (`users` table / `UserRow`).
+   - Verified that no trusted `role` column exists on the `users` table or database rows.
+   - Identified and closed vulnerability where `/admin/queues` was previously mounted without authentication or authorization.
+2. **Admin-Only Authorization Middleware (`requireAdmin.ts`)**:
+   - Implemented `requireAdmin` middleware enforcing admin privileges.
+   - User identity derived strictly from verified authenticated session (`req.user.id`).
+   - Rejects unauthenticated requests with HTTP 401 (`Authentication required`).
+   - Resolves authorized administrators from environment-configured allowlists:
+     - `ADMIN_USER_IDS`: Comma-separated list of authenticated user UUIDs.
+     - `ADMIN_EMAILS`: Comma-separated list of authenticated user email addresses (case-insensitive).
+   - **Fail-Closed Security Design**: If neither `ADMIN_USER_IDS` nor `ADMIN_EMAILS` is configured, access is unconditionally denied with HTTP 403 (`Admin authorization is not configured. Access denied.`).
+   - **Injection Defense**: Client-supplied headers (`x-admin`, `x-role`, `role`, `x-user-role`) and request-body fields (`role: 'admin'`, `isAdmin: true`) are completely ignored.
+3. **Comprehensive Endpoint & Asset Protection**:
+   - Protected every route under `/admin/queues`:
+     - Dashboard root (`/admin/queues`, `/admin/queues/`).
+     - REST API endpoints (`/admin/queues/api/queues`, `/admin/queues/api/queues/:queueName/*`).
+     - Queue mutation actions (retry, clean, promote).
+     - Static assets (`/admin/queues/static/*`).
+4. **Environment Controls & Production Safety**:
+   - Added `BULL_BOARD_ENABLED` toggle (setting to `'false'` blocks all access with HTTP 403).
+   - In production (`NODE_ENV=production`), test bypass headers (`x-test-user-id`) are strictly ignored, ensuring the dashboard can never be accessed without a valid authenticated session.
+5. **Privacy & Safe Logging**:
+   - Sanitized security audit logs: logs only user UUIDs and request URLs.
+   - Zero exposure or logging of session tokens, passwords, cookies, or queue job payloads.
+6. **Queue Functionality Preservation**:
+   - Existing BullMQ scheduling, worker processing, and queue functions remain 100% operational.
+
+### Key Files Created & Modified
+1. `backend/src/middleware/requireAdmin.ts`: New admin authorization middleware with allowlist parsing, fail-closed handling, and sanitized logging.
+2. `backend/src/middleware/requireAuth.ts`: Added optional `x-test-user-email` support in test mode.
+3. `backend/src/routes/queues.ts`: Encapsulated Bull Board ExpressAdapter router within a router protected by `requireAuth` and `requireAdmin`.
+4. `backend/src/routes/index.ts`: Documented `/admin/queues` mount with authentication and admin authorization.
+5. `backend/src/config/index.ts`: Added `admin` configuration section (`userIds`, `emails`, `boardEnabled`).
+6. `backend/.env.example`: Documented `ADMIN_USER_IDS`, `ADMIN_EMAILS`, and `BULL_BOARD_ENABLED`.
+7. `backend/package.json`: Registered `"batch8:test"` script.
+8. `backend/src/scripts/testBatch8BullBoardSecurity.ts`: Comprehensive 15-scenario verification suite.
+9. `docs/IMPLEMENTATION_LOG.md`: Appended Entry 021.
+
+### Actual Test Results
+
+| Test Suite | Command | Result | Notes |
+|---|---|---|---|
+| Batch 8 Verification Suite | `npm run batch8:test` | ✅ PASS | 52/52 assertions passed across all 15 test scenarios |
+| Batch 7B Verification Suite | `npm run batch7b:test` | ✅ PASS | 63/63 assertions passed across all 17 test scenarios |
+| Batch 7A & 7A.2 Verification Suite | `npm run batch7a:test` | ✅ PASS | 119/119 assertions passed across all 16 test scenarios |
+| Batch 6 & 6.1 Verification Suite | `npm run batch6:test` | ✅ PASS | 108/108 assertions passed across all 19 test scenarios |
+| Batch 5 Verification Suite | `npm run batch5:test` | ✅ PASS | 142/142 assertions passed across all 21 test sections |
+| Batch 4 Regression Suite | `npm run batch4:test` | ✅ PASS | 51/51 assertions passed across all 10 scenarios |
+| Batch 3 Regression Suite | `npm run batch3:test` | ✅ PASS | 96/96 assertions passed across all 14 scenarios |
+| Batch 2 Regression Suite | `npm run batch2:test` | ✅ PASS | 25/25 assertions passed across all 9 outbox/persistence scenarios |
+| Batch 1 Regression Suite | `npm run batch1:test` | ✅ PASS | 24/24 assertions passed (concurrency, idempotency, duplicate jobs, uncertain outcome, soft delete) |
+| TypeScript Build | `npm run build` (`tsc`) | ✅ PASS | Zero errors, clean compilation |
+| Production DB Integrity | Direct SQL inspection | ✅ PASS | `reachinbox` database 100% untouched |

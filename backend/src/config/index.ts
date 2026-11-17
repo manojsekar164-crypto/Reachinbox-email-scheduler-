@@ -89,4 +89,17 @@ export const config = {
     pass: getEnv('SMTP_PASS', 'nTeCFEYgHEVPDh8dTx'),
     from: process.env['EMAIL_FROM'] ?? 'yictoylywednjiug@ethereal.email',
   },
+
+  // ─── Admin & Dashboard ──────────────────────────────────────────────────────
+  admin: {
+    userIds: (process.env['ADMIN_USER_IDS'] ?? '')
+      .split(',')
+      .map((id) => id.trim())
+      .filter(Boolean),
+    emails: (process.env['ADMIN_EMAILS'] ?? '')
+      .split(',')
+      .map((e) => e.trim().toLowerCase())
+      .filter(Boolean),
+    boardEnabled: process.env['BULL_BOARD_ENABLED'] !== 'false',
+  },
 } as const;

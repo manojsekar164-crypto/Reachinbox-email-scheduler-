@@ -21,7 +21,7 @@ router.use('/preflight', preflightRouter);
 router.use('/deliveries', deliveriesRouter);
 router.use('/copilot', copilotRouter);
 
-// Expose Bull Board dashboard at /admin/queues (development only)
+// Expose Bull Board dashboard at /admin/queues (protected: authentication and admin authorization required)
 router.use('/admin/queues', queuesDashboardRouter);
 
 export default router;

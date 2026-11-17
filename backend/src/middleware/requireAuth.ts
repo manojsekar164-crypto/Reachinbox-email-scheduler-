@@ -25,9 +25,10 @@ export function requireAuth(
   if (process.env.NODE_ENV === 'test' || process.env.ALLOW_TEST_AUTH === 'true') {
     const testUserId = req.headers['x-test-user-id'];
     if (testUserId && typeof testUserId === 'string') {
+      const testEmail = req.headers['x-test-user-email'];
       req.user = {
         id: testUserId,
-        email: 'test-api-bypass@reachinbox.test',
+        email: typeof testEmail === 'string' ? testEmail : 'test-api-bypass@reachinbox.test',
         name: 'Test API Bypass User',
         google_id: null,
         created_at: new Date(),
