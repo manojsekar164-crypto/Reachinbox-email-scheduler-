@@ -634,7 +634,7 @@ export async function initializeWorker(dbClient = pool): Promise<Worker<EmailJob
   return null;
 }
 
-if (process.env.START_WORKER !== 'false') {
+if (require.main === module && process.env.START_WORKER !== 'false') {
   initializeWorker().catch((err) => {
     console.error('❌ [Worker Startup] Failed to initialize worker:', err);
   });

@@ -1,15 +1,21 @@
 import { Pool, PoolConfig } from 'pg';
 import { config } from '../config';
 
+const isSslRequired = Boolean(
+  process.env['DATABASE_URL']?.includes('render.com') ||
+  process.env['DATABASE_URL']?.includes('neon.tech') ||
+  process.env['DATABASE_URL']?.includes('sslmode=require') ||
+  process.env['DATABASE_URL']?.includes('ssl=true') ||
+  process.env['NODE_ENV'] === 'production'
+);
+
 const poolConfig: PoolConfig = {
   connectionString: config.db.url,
   // Keep a small, sensible pool for Phase 1
   max: 10,
   idleTimeoutMillis: 30_000,
-  connectionTimeoutMillis: 2_000,
-  ssl: (process.env['DATABASE_URL']?.includes('render.com') || process.env['NODE_ENV'] === 'production')
-    ? { rejectUnauthorized: false }
-    : undefined,
+  connectionTimeoutMillis: 5_000,
+  ssl: isSslRequired ? { rejectUnauthorized: true } : undefined,
 };
 
 export const db = new Pool(poolConfig);

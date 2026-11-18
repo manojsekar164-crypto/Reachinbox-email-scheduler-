@@ -242,7 +242,8 @@ export async function patchSenderHandler(
     }
 
     const user = currentUser(req);
-    const updated = await updateSender(req.params['id']!, user.id, updates);
+    const dbClient = (req as any).dbClient;
+    const updated = await updateSender(req.params['id']!, user.id, updates, dbClient);
     if (!updated) {
       res.status(404).json({ error: 'Sender not found' });
       return;

@@ -1,11 +1,28 @@
 import Redis from 'ioredis';
 import { config } from '../config';
 
+const isRedisTls = Boolean(
+  config.redis.url && (config.redis.url.startsWith('rediss://') || config.redis.url.includes('upstash.io'))
+);
+
+let redisTlsOptions: any = undefined;
+if (isRedisTls && config.redis.url) {
+  try {
+    const parsed = new URL(config.redis.url);
+    redisTlsOptions = {
+      rejectUnauthorized: true,
+      servername: parsed.hostname,
+    };
+  } catch {
+    redisTlsOptions = { rejectUnauthorized: true };
+  }
+}
+
 export const redis = config.redis.url
   ? new Redis(config.redis.url, {
       maxRetriesPerRequest: null,
       lazyConnect: true,
-      tls: config.redis.url.startsWith('rediss://') ? { rejectUnauthorized: false } : undefined,
+      tls: redisTlsOptions,
     })
   : new Redis({
       host: config.redis.host,
@@ -26,7 +43,9 @@ export const redis = config.redis.url
  * Called once during server startup.
  */
 export async function connectRedis(): Promise<void> {
-  await redis.connect();
+  if (redis.status !== 'ready' && redis.status !== 'connecting' && redis.status !== 'connect') {
+    await redis.connect();
+  }
   await redis.ping();
   console.log('✅  Redis connected');
 }

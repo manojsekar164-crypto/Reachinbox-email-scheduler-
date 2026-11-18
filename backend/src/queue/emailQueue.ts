@@ -14,18 +14,47 @@ export interface EmailJobPayload {
 // Queue Configuration
 // ---------------------------------------------------------------------------
 
-// BullMQ requires maxRetriesPerRequest to be null for its Redis connections.
-export const redisConnectionOptions: any = config.redis.url
-  ? {
-      url: config.redis.url,
-      maxRetriesPerRequest: null,
-      tls: config.redis.url.startsWith('rediss://') ? { rejectUnauthorized: false } : undefined,
+/**
+ * Builds BullMQ-compatible Redis connection options from a URL or host/port config.
+ * Handles Upstash rediss:// URLs with strict TLS certificate verification.
+ */
+export function buildRedisConnectionOptions(customUrl?: string): any {
+  const targetUrl = customUrl || config.redis.url;
+  if (targetUrl) {
+    try {
+      const parsed = new URL(targetUrl);
+      const isTls = parsed.protocol === 'rediss:';
+      return {
+        host: parsed.hostname,
+        port: parseInt(parsed.port || (isTls ? '6380' : '6379'), 10),
+        username: parsed.username ? decodeURIComponent(parsed.username) : undefined,
+        password: parsed.password ? decodeURIComponent(parsed.password) : undefined,
+        tls: isTls
+          ? {
+              rejectUnauthorized: true,
+              servername: parsed.hostname,
+            }
+          : undefined,
+        maxRetriesPerRequest: null,
+      };
+    } catch {
+      return {
+        url: targetUrl,
+        maxRetriesPerRequest: null,
+        tls: targetUrl.startsWith('rediss://') ? { rejectUnauthorized: true } : undefined,
+      };
     }
-  : {
-      host: config.redis.host,
-      port: config.redis.port,
-      maxRetriesPerRequest: null,
-    };
+  }
+
+  return {
+    host: config.redis.host,
+    port: config.redis.port,
+    maxRetriesPerRequest: null,
+  };
+}
+
+// BullMQ requires maxRetriesPerRequest to be null for its Redis connections.
+export const redisConnectionOptions: any = buildRedisConnectionOptions();
 
 // Sensible defaults to ensure failing jobs back off and completed jobs do not bloat Redis.
 const defaultJobOptions: DefaultJobOptions = {

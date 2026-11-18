@@ -37,6 +37,7 @@ const TEST_DB_NAME = `reachinbox_sender_update_test_${process.pid}_${Date.now()}
 
 let passed = 0;
 let failed = 0;
+let currentTestPool: Pool | null = null;
 
 function testAssert(condition: boolean, testName: string, detail?: string) {
   if (condition) {
@@ -52,11 +53,13 @@ function mockRequest(options: {
   user?: any;
   params?: any;
   body?: any;
+  dbClient?: any;
 }): any {
   return {
     user: options.user || null,
     params: options.params || {},
     body: options.body || {},
+    dbClient: options.dbClient || currentTestPool,
   };
 }
 
@@ -109,6 +112,7 @@ async function main(): Promise<void> {
     database: TEST_DB_NAME,
     max: 10,
   });
+  currentTestPool = testPool;
 
   try {
     // 2. Run migrations
@@ -195,7 +199,7 @@ async function main(): Promise<void> {
       smtp_secure: true,
       smtp_user: 'new_ethereal_user_2',
       smtp_pass: newPass,
-    });
+    }, testPool);
 
     testAssert(updated !== null, 'Update returns updated sender record');
     testAssert(updated!.id === originalId, 'Sender ID (UUID) is strictly PRESERVED');
@@ -386,6 +390,7 @@ async function main(): Promise<void> {
     console.log(SEP + '\n');
 
   } finally {
+    currentTestPool = null;
     console.log('Cleaning up ephemeral database...');
     await testPool.end();
     await rootClient.query(`
