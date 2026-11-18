@@ -1,5 +1,8 @@
 name: ReachInbox Cloud Email Worker
 
+# NOTE: GitHub Actions scheduled triggers ('schedule') require this workflow file
+# to be present on the repository's default branch (e.g. 'main').
+# Manual triggers ('workflow_dispatch') function on any branch.
 on:
   schedule:
     # Runs every 5 minutes on GitHub Actions shared runners
@@ -14,6 +17,10 @@ on:
         description: 'Idle timeout in seconds before worker exits on empty queue'
         required: false
         default: '15'
+
+# Least-privilege permissions: only read repository code
+permissions:
+  contents: read
 
 # Concurrency group ensures two workflow runs cannot execute concurrently
 concurrency:
@@ -50,17 +57,11 @@ jobs:
       - name: Execute Bounded Cloud Email Worker
         env:
           NODE_ENV: production
+          # Core secrets strictly required by the email worker runtime
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           REDIS_URL: ${{ secrets.REDIS_URL }}
           ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
-          JWT_SECRET: ${{ secrets.JWT_SECRET || 'reachinbox-cloud-worker-jwt-secret-placeholder' }}
-          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
-          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-          GOOGLE_CALLBACK_URL: ${{ secrets.GOOGLE_CALLBACK_URL }}
-          SLACK_CLIENT_ID: ${{ secrets.SLACK_CLIENT_ID }}
-          SLACK_CLIENT_SECRET: ${{ secrets.SLACK_CLIENT_SECRET }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL || 'gemini-3.1-flash-lite' }}
+          # Bounded worker operational limits
           WORKER_MAX_DURATION_SECONDS: ${{ github.event.inputs.max_duration_seconds || '240' }}
           WORKER_IDLE_TIMEOUT_SECONDS: ${{ github.event.inputs.idle_timeout_seconds || '15' }}
           WORKER_CONCURRENCY: '2'
