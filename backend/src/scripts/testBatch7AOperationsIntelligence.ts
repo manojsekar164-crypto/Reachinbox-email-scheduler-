@@ -33,7 +33,7 @@ import { execSync } from 'child_process';
 import { Queue } from 'bullmq';
 import { runMigrations } from '../db/migrate';
 import { redis } from '../db/redis';
-import { emailQueue, redisConnectionOptions, EmailJobPayload } from '../queue/emailQueue';
+import { emailQueueName, redisConnectionOptions, EmailJobPayload } from '../queue/emailQueue';
 import {
   getCampaignIntelligence,
   getDeliveryFailureIntelligence,
@@ -125,6 +125,12 @@ async function runBatch7AVerification(): Promise<void> {
         'Migrations executed successfully'
       );
 
+      // Isolated test queue instance for Ops Intelligence tests (never touches shared email-queue)
+      const TEST_QUEUE_NAME = `${testEmailQueueName}-opsintel-${Date.now()}`;
+      const testEmailQueue = new Queue<EmailJobPayload>(TEST_QUEUE_NAME, {
+        connection: redisConnectionOptions,
+      });
+
       // Clean test Redis state
       console.log('\n4. Preparing Redis test keys...');
       const redisKeys = await redis.keys('rate-limit:*');
@@ -132,11 +138,11 @@ async function runBatch7AVerification(): Promise<void> {
         await redis.del(...redisKeys);
       }
       await redis.del('email-send:global:last-send');
-      await emailQueue.drain();
-      await emailQueue.clean(0, 1000, 'delayed');
-      await emailQueue.clean(0, 1000, 'wait');
-      await emailQueue.clean(0, 1000, 'active');
-      await emailQueue.clean(0, 1000, 'failed');
+      await testEmailQueue.drain();
+      await testEmailQueue.clean(0, 1000, 'delayed');
+      await testEmailQueue.clean(0, 1000, 'wait');
+      await testEmailQueue.clean(0, 1000, 'active');
+      await testEmailQueue.clean(0, 1000, 'failed');
 
       // 5. Seed Multi-Tenant Fixtures
       console.log('\n5. Seeding multi-tenant test fixtures in isolated database...');
@@ -571,16 +577,16 @@ async function runBatch7AVerification(): Promise<void> {
       console.log('TEST 6: Queue Waiting, Active, Delayed, and Failed Job Counts');
       console.log(SUB_SEP);
 
-      // Add jobs to emailQueue: 1 for User A, 1 for User B, 1 delayed for User A
-      await emailQueue.add('test_job_a1', {
+      // Add jobs to testEmailQueue: 1 for User A, 1 for User B, 1 delayed for User A
+      await testEmailQueue.add('test_job_a1', {
         campaignId: campA1Id,
         recipientId: 'r_dummy_a1',
       });
-      await emailQueue.add('test_job_b1', {
+      await testEmailQueue.add('test_job_b1', {
         campaignId: campBId,
         recipientId: 'r_dummy_b1',
       });
-      await emailQueue.add(
+      await testEmailQueue.add(
         'test_job_a_delayed',
         {
           campaignId: campA1Id,
@@ -589,7 +595,7 @@ async function runBatch7AVerification(): Promise<void> {
         { delay: 60000 }
       );
 
-      const queueIntelA = await getQueueIntelligence(userAId, emailQueue, testPool, redis);
+      const queueIntelA = await getQueueIntelligence(userAId, testEmailQueue, testPool, redis);
       assert(queueIntelA.is_available === true, 'Queue is reported as available');
       assert(queueIntelA.queue_name === 'email-queue', 'Queue name matches email-queue');
       assert(queueIntelA.global_counts === null, 'Global queue counts are strictly NULL (never exposed to ordinary users)');
@@ -614,7 +620,7 @@ async function runBatch7AVerification(): Promise<void> {
       );
 
       // User B query
-      const queueIntelB = await getQueueIntelligence(userBId, emailQueue, testPool, redis);
+      const queueIntelB = await getQueueIntelligence(userBId, testEmailQueue, testPool, redis);
       assert(
         queueIntelB.user_counts!.waiting === 1,
         'User B user-scoped waiting count is strictly 1 (User A job excluded)'
@@ -642,12 +648,12 @@ async function runBatch7AVerification(): Promise<void> {
           },
         });
       }
-      await emailQueue.addBulk(bulkJobs);
+      await testEmailQueue.addBulk(bulkJobs);
 
       // Complete pagination scan (> 500 jobs)
       const queueIntelLarge = await getQueueIntelligence(
         userAId,
-        emailQueue,
+        testEmailQueue,
         testPool,
         redis,
         { sampleLimit: 2500 }
@@ -664,7 +670,7 @@ async function runBatch7AVerification(): Promise<void> {
       // Bounded partial scan (sampleLimit = 300)
       const queueIntelPartial = await getQueueIntelligence(
         userAId,
-        emailQueue,
+        testEmailQueue,
         testPool,
         redis,
         { sampleLimit: 300 }
@@ -731,7 +737,7 @@ async function runBatch7AVerification(): Promise<void> {
       assert(failIntelC.total_failed_deliveries === 0, 'Empty user has 0 failed deliveries');
       assert(failIntelC.total_unknown_deliveries === 0, 'Empty user has 0 unknown deliveries');
 
-      const queueIntelC = await getQueueIntelligence(userCId, emailQueue, testPool, redis);
+      const queueIntelC = await getQueueIntelligence(userCId, testEmailQueue, testPool, redis);
       assert(queueIntelC.user_scoped_counts?.waiting === 0, 'Empty user has 0 user-scoped queue jobs');
 
       // ---------------------------------------------------------------------
@@ -750,7 +756,7 @@ async function runBatch7AVerification(): Promise<void> {
 
       const queueIntelUnavail = await getQueueIntelligence(
         userAId,
-        emailQueue,
+        testEmailQueue,
         testPool,
         fakeUnavailableRedis
       );
@@ -801,7 +807,7 @@ async function runBatch7AVerification(): Promise<void> {
       // Set up a simulated rate limit bottleneck in Redis for Campaign A1
       await redis.set(`rate-limit:campaign:${campA1Id}`, '50', 'EX', 1800);
 
-      const opsContext = await getOperationsContext(userAId, {}, testPool, redis, emailQueue);
+      const opsContext = await getOperationsContext(userAId, {}, testPool, redis, testEmailQueue);
       assert(opsContext.user_id === userAId, 'Operations context is bound to User A');
       assert(Boolean(opsContext.timestamp), 'Operations context contains fresh timestamp');
 
@@ -875,7 +881,7 @@ async function runBatch7AVerification(): Promise<void> {
         // Also simulate sender limit exhaustion for Sender A1
         await redis.set(`rate-limit:sender:${senderA1Id}`, '100', 'EX', 1800);
 
-        const bottlenecksRes = await analyzeOperationalBottlenecks(userAId, testPool, redis, emailQueue);
+        const bottlenecksRes = await analyzeOperationalBottlenecks(userAId, testPool, redis, testEmailQueue);
         const globalBottleneck = bottlenecksRes.bottlenecks.find(
           (b) => b.bottleneck_type === 'global_rate_limit_exhausted'
         );
@@ -926,7 +932,7 @@ async function runBatch7AVerification(): Promise<void> {
         );
 
         // Verify getOperationsContext() for LLM context privacy
-        const globalOpsContext = await getOperationsContext(userAId, {}, testPool, redis, emailQueue);
+        const globalOpsContext = await getOperationsContext(userAId, {}, testPool, redis, testEmailQueue);
         const globalCtxJson = JSON.stringify(globalOpsContext);
 
         assert(
@@ -981,9 +987,9 @@ async function runBatch7AVerification(): Promise<void> {
       await getCampaignIntelligence(userAId, {}, testPool);
       await getDeliveryFailureIntelligence(userAId, {}, testPool);
       await getSenderPerformanceIntelligence(userAId, testPool);
-      await getQueueIntelligence(userAId, emailQueue, testPool, redis);
-      await analyzeOperationalBottlenecks(userAId, testPool, redis, emailQueue);
-      await getOperationsContext(userAId, {}, testPool, redis, emailQueue);
+      await getQueueIntelligence(userAId, testEmailQueue, testPool, redis);
+      await analyzeOperationalBottlenecks(userAId, testPool, redis, testEmailQueue);
+      await getOperationsContext(userAId, {}, testPool, redis, testEmailQueue);
 
       const afterCounts = await testClient.query(`
         SELECT
@@ -1051,7 +1057,8 @@ async function runBatch7AVerification(): Promise<void> {
   console.log(SEP + '\n');
 
   try {
-    await emailQueue.close();
+    try { await testEmailQueue.obliterate({ force: true }); } catch (_) {}
+    await testEmailQueue.close();
     await redis.quit();
   } catch (_) {}
 

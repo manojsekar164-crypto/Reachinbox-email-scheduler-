@@ -61,6 +61,8 @@ export interface DeliveryListItem {
     completed_at: string | null;
   } | null;
   retry_eligibility: RetryEligibilityInfo;
+  retry_eligible?: boolean;
+  retry_reason?: string;
 }
 
 export interface DeliveryDetailResult extends DeliveryListItem {

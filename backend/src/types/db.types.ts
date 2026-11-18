@@ -28,6 +28,8 @@ export interface CampaignRow {
   status: CampaignStatus;
   created_at: Date;
   updated_at: Date;
+  recipient_count?: number;
+  recipients_count?: number;
 }
 
 // ─── recipients ───────────────────────────────────────────────────────────────

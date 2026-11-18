@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Calendar, RefreshCw, Plus, Shield, Clock, Users, Trash2, X, Mail } from 'lucide-react';
+import { Calendar, RefreshCw, Plus, Shield, Clock, Users, Trash2, X, Mail, Pause, Play, Ban } from 'lucide-react';
 import type { Campaign, Sender, Recipient } from '../types';
 import { StatusBadge } from '../components/ui/StatusBadge';
 import { EmptyState } from '../components/ui/EmptyState';
@@ -27,6 +27,50 @@ export const ScheduledListView: React.FC<ScheduledListViewProps> = ({
   const [recipients, setRecipients] = useState<Recipient[]>([]);
   const [recipientsLoading, setRecipientsLoading] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [actionLoadingId, setActionLoadingId] = useState<string | null>(null);
+
+  const handlePauseCampaign = async (campaignId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      setActionLoadingId(campaignId);
+      const res = await campaignApi.pause(campaignId);
+      success(res.message || 'Campaign paused successfully.');
+      onRefresh();
+    } catch (err: any) {
+      error(err.message || 'Failed to pause campaign');
+    } finally {
+      setActionLoadingId(null);
+    }
+  };
+
+  const handleResumeCampaign = async (campaignId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      setActionLoadingId(campaignId);
+      const res = await campaignApi.resume(campaignId);
+      success(res.message || 'Campaign resumed successfully.');
+      onRefresh();
+    } catch (err: any) {
+      error(err.message || 'Failed to resume campaign');
+    } finally {
+      setActionLoadingId(null);
+    }
+  };
+
+  const handleCancelCampaign = async (campaignId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!window.confirm('Are you sure you want to cancel remaining dispatches for this campaign?')) return;
+    try {
+      setActionLoadingId(campaignId);
+      const res = await campaignApi.cancel(campaignId);
+      success(res.message || 'Campaign cancelled successfully.');
+      onRefresh();
+    } catch (err: any) {
+      error(err.message || 'Failed to cancel campaign');
+    } finally {
+      setActionLoadingId(null);
+    }
+  };
 
   const getSenderName = (senderId: string | null) => {
     if (!senderId) return 'Default Sender';
@@ -167,6 +211,41 @@ export const ScheduledListView: React.FC<ScheduledListViewProps> = ({
                       </td>
                       <td className="py-3.5 px-4 text-right whitespace-nowrap">
                         <div className="flex items-center justify-end gap-1.5">
+                          {/* Lifecycle Controls: Pause / Resume / Cancel */}
+                          {camp.status === 'paused' ? (
+                            <button
+                              onClick={(e) => handleResumeCampaign(camp.id, e)}
+                              disabled={actionLoadingId === camp.id}
+                              className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-bold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 rounded-md border border-emerald-200 transition-colors"
+                              title="Resume Campaign"
+                            >
+                              <Play className="w-3 h-3 fill-current" />
+                              <span>Resume</span>
+                            </button>
+                          ) : (camp.status === 'sending' || camp.status === 'scheduled') ? (
+                            <button
+                              onClick={(e) => handlePauseCampaign(camp.id, e)}
+                              disabled={actionLoadingId === camp.id}
+                              className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-bold text-amber-700 bg-amber-50 hover:bg-amber-100 rounded-md border border-amber-200 transition-colors"
+                              title="Pause Campaign"
+                            >
+                              <Pause className="w-3 h-3 fill-current" />
+                              <span>Pause</span>
+                            </button>
+                          ) : null}
+
+                          {camp.status !== 'cancelled' && camp.status !== 'completed' && (
+                            <button
+                              onClick={(e) => handleCancelCampaign(camp.id, e)}
+                              disabled={actionLoadingId === camp.id}
+                              className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-bold text-rose-700 bg-rose-50 hover:bg-rose-100 rounded-md border border-rose-200 transition-colors"
+                              title="Cancel remaining dispatches"
+                            >
+                              <Ban className="w-3 h-3" />
+                              <span>Cancel</span>
+                            </button>
+                          )}
+
                           <button
                             onClick={(e) => {
                               e.stopPropagation();
@@ -175,13 +254,13 @@ export const ScheduledListView: React.FC<ScheduledListViewProps> = ({
                             className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold text-indigo-600 hover:text-indigo-800 hover:bg-indigo-50 rounded-md transition-colors"
                           >
                             <Users className="w-3 h-3" />
-                            <span>Recipients</span>
+                            <span>Recipients{camp.recipient_count !== undefined ? ` (${camp.recipient_count})` : ''}</span>
                           </button>
                           <button
                             onClick={(e) => handleDeleteCampaign(camp.id, e)}
                             disabled={deletingId === camp.id}
                             className="p-1 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-md transition-colors disabled:opacity-50"
-                            title="Cancel & Delete Campaign"
+                            title="Delete Campaign"
                           >
                             <Trash2 className="w-3.5 h-3.5" />
                           </button>

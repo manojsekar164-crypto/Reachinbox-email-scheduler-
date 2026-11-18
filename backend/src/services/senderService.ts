@@ -121,7 +121,8 @@ export async function getSenderByIdInternal(
 export async function updateSender(
   id: string,
   userId: string,
-  updates: UpdateSenderInput
+  updates: UpdateSenderInput,
+  client: { query: (sql: string, params?: any[]) => Promise<any> } = db
 ): Promise<SenderRow | null> {
   const setClauses: string[] = [];
   const values: unknown[] = [];
@@ -176,7 +177,7 @@ export async function updateSender(
     RETURNING *
   `;
 
-  const { rows } = await db.query<SenderRow>(sql, values);
+  const { rows } = await client.query(sql, values);
   return mapSenderRow(rows[0] ?? null);
 }
 

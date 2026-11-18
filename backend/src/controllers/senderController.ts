@@ -220,9 +220,12 @@ export async function patchSenderHandler(
     }
 
     if (body['smtp_pass'] !== undefined) {
-      const pass = typeof body['smtp_pass'] === 'string' ? body['smtp_pass'] : '';
-      if (!pass) errors.push('smtp_pass must be a non-empty string');
-      else updates.smtp_pass = pass;
+      if (typeof body['smtp_pass'] !== 'string') {
+        errors.push('smtp_pass must be a string');
+      } else if (body['smtp_pass'].length > 0) {
+        updates.smtp_pass = body['smtp_pass'];
+      }
+      // If empty string, treat as leaving password unchanged
     }
 
     if (errors.length > 0) {

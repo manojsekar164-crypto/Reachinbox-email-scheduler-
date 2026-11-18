@@ -6,6 +6,11 @@
  * Uses Node native fetch with strict timeouts, bounded context, and safe error handling.
  */
 
+import dns from 'dns';
+try {
+  dns.setDefaultResultOrder('ipv4first');
+} catch (_) {}
+
 import {
   ILLMProvider,
   LLMMessage,
@@ -18,8 +23,17 @@ import {
   CopilotProviderError,
 } from '../types/copilot.types';
 
-const DEFAULT_TIMEOUT_MS = 15000;
+const DEFAULT_TIMEOUT_MS = 60000;
 const DEFAULT_MAX_TOKENS = 1024;
+
+function sanitizeError(raw: string): string {
+  if (!raw) return '';
+  return raw
+    .replace(/key=[^&\s"'`]+/gi, 'key=[REDACTED]')
+    .replace(/(?:api[_-]?key|token)["':\s]+["']?([a-zA-Z0-9_\-\.]{8,})["']?/gi, 'apiKey: "[REDACTED]"')
+    .replace(/Bearer\s+[a-zA-Z0-9_\-\.]+/gi, 'Bearer [REDACTED]')
+    .trim();
+}
 
 // ─── 1. OpenAI-Compatible Provider ──────────────────────────────────────────
 
@@ -221,7 +235,9 @@ export class GeminiProvider implements ILLMProvider {
 
   constructor(apiKey: string, model?: string) {
     this.apiKey = apiKey;
-    this.modelName = model || process.env['GEMINI_MODEL'] || process.env['LLM_MODEL'] || 'gemini-1.5-flash';
+    const rawModel = model || process.env['GEMINI_MODEL'] || process.env['LLM_MODEL'] || 'gemini-3.1-flash-lite';
+    // Normalize model name: remove any leading "models/" prefix and extraneous whitespace
+    this.modelName = rawModel.trim().replace(/^models\//i, '');
   }
 
   public isConfigured(): boolean {
@@ -246,7 +262,8 @@ export class GeminiProvider implements ILLMProvider {
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.modelName}:generateContent?key=${encodeURIComponent(
+      const cleanModel = encodeURIComponent(this.modelName);
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${cleanModel}:generateContent?key=${encodeURIComponent(
         this.apiKey
       )}`;
 
@@ -272,26 +289,86 @@ export class GeminiProvider implements ILLMProvider {
       });
 
       if (!response.ok) {
-        if (response.status === 400 || response.status === 401 || response.status === 403) {
-          throw new CopilotProviderAuthError('Gemini authentication or authorization failed: check API key.');
+        let errorDetails = '';
+        try {
+          const errData: any = await response.json();
+          if (errData?.error?.message) {
+            errorDetails = sanitizeError(errData.error.message);
+          }
+        } catch {
+          const errText = await response.text().catch(() => '');
+          errorDetails = sanitizeError(errText.slice(0, 300));
         }
+
+        // Explicit error classification for 400, 401, 403, 404, 429, 503
+        if (response.status === 400) {
+          const lower = errorDetails.toLowerCase();
+          if (lower.includes('api key not valid') || lower.includes('invalid api key')) {
+            throw new CopilotProviderAuthError('Gemini API key is invalid or unrecognized.');
+          }
+          throw new CopilotProviderError(
+            `Gemini invalid request parameters (400): ${errorDetails || 'Bad Request'}`,
+            400
+          );
+        }
+
+        if (response.status === 401) {
+          throw new CopilotProviderAuthError(
+            `Gemini authentication failed (401): ${errorDetails || 'Invalid API credentials.'}`
+          );
+        }
+
+        if (response.status === 403) {
+          throw new CopilotProviderAuthError(
+            `Gemini authorization failed (403): ${errorDetails || 'API key lacks required permissions or has project restrictions.'}`
+          );
+        }
+
+        if (response.status === 404) {
+          throw new CopilotProviderError(
+            `Gemini model "${this.modelName}" was not found for API version v1beta, or is not supported for generateContent (404). Configure GEMINI_MODEL with an available model (e.g. gemini-3.6-flash). Details: ${errorDetails || '404 Not Found'}`,
+            404
+          );
+        }
+
         if (response.status === 429) {
-          throw new CopilotRateLimitError('Gemini rate limit exceeded. Please retry later.', 60);
+          throw new CopilotRateLimitError(
+            `Gemini rate limit or quota exceeded (429): ${errorDetails || 'Please retry later.'}`,
+            60
+          );
         }
-        const errText = await response.text().catch(() => '');
+
+        if (response.status === 503) {
+          throw new CopilotProviderError(
+            `Gemini service is temporarily unavailable or overloaded (503): ${errorDetails || 'Service Unavailable'}`,
+            503
+          );
+        }
+
         throw new CopilotProviderError(
-          `Gemini provider returned error (${response.status}): ${errText.slice(0, 200)}`,
+          `Gemini provider returned error (${response.status}): ${errorDetails || 'Unknown error'}`,
           response.status >= 500 ? 503 : 502
         );
       }
 
       const data: any = await response.json();
-      const content = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (!content || typeof content !== 'string') {
+      const rawParts = data?.candidates?.[0]?.content?.parts;
+      let content = '';
+      if (Array.isArray(rawParts)) {
+        content = rawParts
+          .map((p: any) => (typeof p.text === 'string' ? p.text : ''))
+          .filter(Boolean)
+          .join('\n')
+          .trim();
+      }
+      if (!content && typeof data?.candidates?.[0]?.text === 'string') {
+        content = data.candidates[0].text.trim();
+      }
+      if (!content) {
         throw new CopilotProviderError('Gemini returned empty or unexpected response format.', 502);
       }
 
-      return content.trim();
+      return content;
     } catch (err: any) {
       if (err.name === 'AbortError') {
         throw new CopilotTimeoutError(`Gemini request timed out after ${timeoutMs}ms.`);
@@ -305,7 +382,8 @@ export class GeminiProvider implements ILLMProvider {
       ) {
         throw err;
       }
-      throw new CopilotProviderError(`Gemini connection error: ${err.message || 'Network failure'}`, 503);
+      const sanitized = sanitizeError(err.message || 'Network failure');
+      throw new CopilotProviderError(`Gemini connection error: ${sanitized}`, 503);
     } finally {
       clearTimeout(timer);
     }

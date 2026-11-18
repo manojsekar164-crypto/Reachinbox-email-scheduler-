@@ -82,6 +82,17 @@ export function evaluateRetryEligibility(
     return { is_eligible: false, reason: 'Delivery has been deleted' };
   }
 
+  if (
+    delivery.status === 'scheduled' ||
+    delivery.status === 'pending' ||
+    Number(delivery.attempt_count) === 0
+  ) {
+    return {
+      is_eligible: false,
+      reason: 'Scheduled or unattempted delivery cannot be retried',
+    };
+  }
+
   if (delivery.status === 'sent') {
     return { is_eligible: false, reason: 'Delivery has already succeeded' };
   }
@@ -214,14 +225,30 @@ export async function listDeliveries(
   const whereConditions: string[] = ['c.user_id = $1', 'ed.deleted_at IS NULL'];
   const params: any[] = [userId];
 
-  if (status) {
+  // Strictly exclude scheduled, pending, sending and unattempted deliveries from Recovery Center
+  whereConditions.push(`ed.status NOT IN ('scheduled', 'pending', 'sending')`);
+  whereConditions.push(`ed.attempt_count > 0`);
+
+  if (status && (status as any) !== 'all') {
     if (Array.isArray(status)) {
-      params.push(status);
-      whereConditions.push(`ed.status = ANY($${params.length}::varchar[])`);
+      const validStatuses = status.filter((s) => s !== 'scheduled' && s !== 'pending' && s !== 'sending');
+      if (validStatuses.length === 0) {
+        whereConditions.push('1 = 0');
+      } else {
+        params.push(validStatuses);
+        whereConditions.push(`ed.status = ANY($${params.length}::varchar[])`);
+      }
     } else {
-      params.push(status);
-      whereConditions.push(`ed.status = $${params.length}`);
+      if (status === 'scheduled' || status === 'pending' || status === 'sending') {
+        whereConditions.push('1 = 0');
+      } else {
+        params.push(status);
+        whereConditions.push(`ed.status = $${params.length}`);
+      }
     }
+  } else {
+    // Default for Recovery Center (All Issues): show only genuine recovery cases (failed, unknown)
+    whereConditions.push(`ed.status IN ('failed', 'unknown')`);
   }
 
   if (campaignId) {
@@ -357,6 +384,8 @@ export async function listDeliveries(
       updated_at: new Date(row.updated_at).toISOString(),
       latest_attempt: latestAttempt,
       retry_eligibility: retryEligibility,
+      retry_eligible: retryEligibility.is_eligible,
+      retry_reason: retryEligibility.reason,
     };
   });
 
@@ -485,6 +514,8 @@ export async function getDeliveryDetail(
         }
       : null,
     retry_eligibility: retryEligibility,
+    retry_eligible: retryEligibility.is_eligible,
+    retry_reason: retryEligibility.reason,
     attempts,
     resolutions,
   };
@@ -612,6 +643,24 @@ export async function manualRetryDelivery(
 
     if (pendingOutbox.rows.length > 0) {
       const error: any = new Error('A retry request is already queued or in progress for this delivery');
+      error.statusCode = 409;
+      throw error;
+    }
+
+    // Prevent retrying scheduled or unattempted deliveries
+    if (delivery.status === 'scheduled' || Number(delivery.attempt_count) === 0) {
+      const error: any = new Error(
+        'Cannot retry delivery: scheduled or unattempted deliveries cannot be retried'
+      );
+      error.statusCode = 400;
+      throw error;
+    }
+
+    // Delivery is already pending retry / dispatch
+    if (delivery.status === 'pending') {
+      const error: any = new Error(
+        'A retry request is already queued or in progress for this delivery'
+      );
       error.statusCode = 409;
       throw error;
     }
@@ -778,6 +827,12 @@ export async function resolveUnknownDelivery(
 
     if (delivery.status !== 'unknown') {
       const error: any = new Error(`Cannot resolve delivery: status is '${delivery.status}' (only 'unknown' deliveries can be resolved)`);
+      error.statusCode = 400;
+      throw error;
+    }
+
+    if (Number(delivery.attempt_count) === 0) {
+      const error: any = new Error('Cannot resolve delivery: unattempted deliveries cannot be resolved');
       error.statusCode = 400;
       throw error;
     }

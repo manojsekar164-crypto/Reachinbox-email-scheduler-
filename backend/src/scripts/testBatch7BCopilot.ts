@@ -36,9 +36,10 @@ import { Client, Pool } from 'pg';
 import { execSync } from 'child_process';
 import http from 'http';
 import express from 'express';
+import { Queue } from 'bullmq';
 import { runMigrations } from '../db/migrate';
 import { redis } from '../db/redis';
-import { emailQueue, EmailJobPayload } from '../queue/emailQueue';
+import { emailQueueName, redisConnectionOptions, EmailJobPayload } from '../queue/emailQueue';
 import { createApp } from '../app';
 import { handleCopilotChat } from '../services/copilotService';
 import { copilotChatHandler } from '../controllers/copilotController';
@@ -131,6 +132,12 @@ async function runBatch7BVerification(): Promise<void> {
       max: 10,
     });
 
+    // Isolated test queue instance for Copilot tests (never touches shared email-queue)
+    const TEST_QUEUE_NAME = `${emailQueueName}-copilot-${Date.now()}`;
+    const testEmailQueue = new Queue<EmailJobPayload>(TEST_QUEUE_NAME, {
+      connection: redisConnectionOptions,
+    });
+
     try {
       const migrationResult = await runMigrations(testClient);
       console.log(
@@ -148,11 +155,11 @@ async function runBatch7BVerification(): Promise<void> {
         await redis.del(...redisKeys);
       }
       await redis.del('email-send:global:last-send');
-      await emailQueue.drain();
-      await emailQueue.clean(0, 1000, 'delayed');
-      await emailQueue.clean(0, 1000, 'wait');
-      await emailQueue.clean(0, 1000, 'active');
-      await emailQueue.clean(0, 1000, 'failed');
+      await testEmailQueue.drain();
+      await testEmailQueue.clean(0, 1000, 'delayed');
+      await testEmailQueue.clean(0, 1000, 'wait');
+      await testEmailQueue.clean(0, 1000, 'active');
+      await testEmailQueue.clean(0, 1000, 'failed');
 
       // 5. Seed Multi-Tenant Fixtures
       console.log('\n5. Seeding multi-tenant test fixtures in isolated database...');
@@ -368,13 +375,16 @@ async function runBatch7BVerification(): Promise<void> {
         null
       );
 
+      let seededJobA: any = null;
+      let seededJobB: any = null;
+
       // Seed Queue Job for User A
       const rA1 = await testClient.query(
         `SELECT id FROM recipients WHERE campaign_id = $1 LIMIT 1;`,
         [campA1Id]
       );
       const recA1 = rA1.rows[0].id;
-      await emailQueue.add('send-email', {
+      seededJobA = await testEmailQueue.add('send-email', {
         campaignId: campA1Id,
         recipientId: recA1,
         messageId: 'test-job-a1',
@@ -385,7 +395,7 @@ async function runBatch7BVerification(): Promise<void> {
         `INSERT INTO recipients (campaign_id, email, name, status) VALUES ($1, 'rec_b@test.com', 'Rec B', 'pending') RETURNING id;`,
         [campBId]
       );
-      await emailQueue.add('send-email', {
+      seededJobB = await testEmailQueue.add('send-email', {
         campaignId: campBId,
         recipientId: rB.rows[0].id,
         messageId: 'test-job-b-victim',
@@ -431,7 +441,7 @@ async function runBatch7BVerification(): Promise<void> {
       const q1Res = await handleCopilotChat(
         userAId,
         { question: 'How many campaigns are currently active?' },
-        { dbPool: testPool, redisClient: redis, queue: emailQueue, llmProvider: mockProvider }
+        { dbPool: testPool, redisClient: redis, queue: testEmailQueue, llmProvider: mockProvider }
       );
       assert(q1Res.success === true, 'Response marked success');
       assert(q1Res.answer.includes('2 active campaign(s)'), 'Accurately reports 2 active sending campaigns');
@@ -443,7 +453,7 @@ async function runBatch7BVerification(): Promise<void> {
       const q1BRes = await handleCopilotChat(
         userAId,
         { question: 'Which campaign has the highest failure rate?' },
-        { dbPool: testPool, redisClient: redis, queue: emailQueue, llmProvider: mockProvider }
+        { dbPool: testPool, redisClient: redis, queue: testEmailQueue, llmProvider: mockProvider }
       );
       assert(q1BRes.answer.includes('Campaign A2 High Failure'), 'Identifies Campaign A2 as highest failure campaign');
       assert(
@@ -461,7 +471,7 @@ async function runBatch7BVerification(): Promise<void> {
       const q2Res = await handleCopilotChat(
         userAId,
         { question: 'Why are email deliveries failing?' },
-        { dbPool: testPool, redisClient: redis, queue: emailQueue, llmProvider: mockProvider }
+        { dbPool: testPool, redisClient: redis, queue: testEmailQueue, llmProvider: mockProvider }
       );
       assert(q2Res.answer.includes('550 5.1.1 User unknown'), 'Reports actual error message from email_attempts');
       assert(
@@ -479,7 +489,7 @@ async function runBatch7BVerification(): Promise<void> {
       const q3Res = await handleCopilotChat(
         userAId,
         { question: 'Which sender has the most confirmed SMTP acceptances?' },
-        { dbPool: testPool, redisClient: redis, queue: emailQueue, llmProvider: mockProvider }
+        { dbPool: testPool, redisClient: redis, queue: testEmailQueue, llmProvider: mockProvider }
       );
       assert(q3Res.answer.includes('Sender A1 Primary'), 'Identifies top sender by confirmed SMTP acceptances');
       assert(q3Res.answer.includes('3 verified 250 OK'), 'Cites verified RFC 5321 250 OK MTA acceptances');
@@ -495,7 +505,7 @@ async function runBatch7BVerification(): Promise<void> {
       const q4Res = await handleCopilotChat(
         userAId,
         { question: 'How many emails are waiting in the queue?' },
-        { dbPool: testPool, redisClient: redis, queue: emailQueue, llmProvider: mockProvider }
+        { dbPool: testPool, redisClient: redis, queue: testEmailQueue, llmProvider: mockProvider }
       );
       assert(q4Res.answer.includes('1 emails waiting in your tenant queue'), 'Reports strictly tenant waiting jobs (User B job excluded)');
       assert(
@@ -513,7 +523,7 @@ async function runBatch7BVerification(): Promise<void> {
       const q5Res = await handleCopilotChat(
         userAId,
         { question: 'Are there deliveries with uncertain SMTP outcomes?' },
-        { dbPool: testPool, redisClient: redis, queue: emailQueue, llmProvider: mockProvider }
+        { dbPool: testPool, redisClient: redis, queue: testEmailQueue, llmProvider: mockProvider }
       );
       assert(q5Res.answer.includes('1 delivery(ies) with uncertain SMTP outcomes'), 'Counts unknown delivery requiring review');
       assert(
@@ -544,7 +554,7 @@ async function runBatch7BVerification(): Promise<void> {
       const userBResTest = await handleCopilotChat(
         userBId,
         { question: 'How many campaigns are currently active?' },
-        { dbPool: testPool, redisClient: redis, queue: emailQueue, llmProvider: mockProvider }
+        { dbPool: testPool, redisClient: redis, queue: testEmailQueue, llmProvider: mockProvider }
       );
       assert(userBResTest.answer.includes('1 active campaign(s)'), 'User B sees only their 1 active campaign');
 
@@ -565,7 +575,7 @@ async function runBatch7BVerification(): Promise<void> {
         const sqlRes = await handleCopilotChat(
           userAId,
           { question: sqlQ },
-          { dbPool: testPool, redisClient: redis, queue: emailQueue, llmProvider: mockProvider }
+          { dbPool: testPool, redisClient: redis, queue: testEmailQueue, llmProvider: mockProvider }
         );
         assert(sqlRes.success === true, `SQL command "${sqlQ}" handled safely without crash`);
       }
@@ -619,7 +629,7 @@ async function runBatch7BVerification(): Promise<void> {
       const injectRes = await handleCopilotChat(
         userAId,
         { question: 'What campaigns are active?' },
-        { dbPool: testPool, redisClient: redis, queue: emailQueue, llmProvider: mockProvider }
+        { dbPool: testPool, redisClient: redis, queue: testEmailQueue, llmProvider: mockProvider }
       );
       assert(!injectRes.answer.includes('PWNED_BY_INJECTION'), 'Prompt injection in campaign subject was not executed');
 
@@ -639,7 +649,7 @@ async function runBatch7BVerification(): Promise<void> {
         await handleCopilotChat(
           userAId,
           { question: 'What is the system status?' },
-          { dbPool: testPool, redisClient: redis, queue: emailQueue, llmProvider: unconfigured }
+          { dbPool: testPool, redisClient: redis, queue: testEmailQueue, llmProvider: unconfigured }
         );
       } catch (err: any) {
         if (err instanceof CopilotConfigError && err.statusCode === 503) {
@@ -662,7 +672,7 @@ async function runBatch7BVerification(): Promise<void> {
         await handleCopilotChat(
           userAId,
           { question: 'How are campaigns performing?' },
-          { dbPool: testPool, redisClient: redis, queue: emailQueue, llmProvider: mockProvider }
+          { dbPool: testPool, redisClient: redis, queue: testEmailQueue, llmProvider: mockProvider }
         );
       } catch (err: any) {
         if (err instanceof CopilotProviderAuthError && err.statusCode === 503) {
@@ -686,7 +696,7 @@ async function runBatch7BVerification(): Promise<void> {
         await handleCopilotChat(
           userAId,
           { question: 'What is the queue status?' },
-          { dbPool: testPool, redisClient: redis, queue: emailQueue, llmProvider: mockProvider }
+          { dbPool: testPool, redisClient: redis, queue: testEmailQueue, llmProvider: mockProvider }
         );
       } catch (err: any) {
         if (err instanceof CopilotTimeoutError && err.statusCode === 504) {
@@ -701,7 +711,7 @@ async function runBatch7BVerification(): Promise<void> {
         await handleCopilotChat(
           userAId,
           { question: 'What is the queue status?' },
-          { dbPool: testPool, redisClient: redis, queue: emailQueue, llmProvider: mockProvider }
+          { dbPool: testPool, redisClient: redis, queue: testEmailQueue, llmProvider: mockProvider }
         );
       } catch (err: any) {
         if (err instanceof CopilotRateLimitError && err.statusCode === 429) {
@@ -766,7 +776,7 @@ async function runBatch7BVerification(): Promise<void> {
       const unsuppRes = await handleCopilotChat(
         userAId,
         { question: 'What is the Twitter follower count of campaign 1?' },
-        { dbPool: testPool, redisClient: redis, queue: emailQueue, llmProvider: mockProvider }
+        { dbPool: testPool, redisClient: redis, queue: testEmailQueue, llmProvider: mockProvider }
       );
       assert(unsuppRes.success === true, 'Handled unsupported query safely');
       assert(!unsuppRes.answer.includes('10000 followers'), 'Did not fabricate non-existent metric');
@@ -786,8 +796,9 @@ async function runBatch7BVerification(): Promise<void> {
       const anthropicInstance = new AnthropicProvider('fake-key-test', 'claude-3-5-sonnet-20241022');
       assert(anthropicInstance.providerName === 'anthropic', 'Anthropic provider exposes providerName');
 
-      const geminiInstance = new GeminiProvider('fake-key-test', 'gemini-1.5-flash');
+      const geminiInstance = new GeminiProvider('fake-key-test', 'gemini-3.1-flash-lite');
       assert(geminiInstance.providerName === 'gemini', 'Gemini provider exposes providerName');
+      assert(geminiInstance.modelName === 'gemini-3.1-flash-lite', 'Gemini provider exposes modelName');
 
       const liveApiKey =
         process.env['OPENAI_API_KEY'] ||
@@ -863,22 +874,45 @@ async function runBatch7BVerification(): Promise<void> {
         assert(oversizedRes.status === 413, 'Oversized payload (>32KB) rejected with HTTP 413');
 
         // 4. Missing provider configuration via HTTP -> HTTP 503
-        // When no env var is set, default provider throws CopilotConfigError -> HTTP 503
-        const noKeyRes = await fetch(`${baseUrl}/copilot/chat`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-test-user-id': userAId,
-          },
-          body: JSON.stringify({ question: 'How many active campaigns?' }),
-        });
-        assert(noKeyRes.status === 503, 'Unconfigured provider via HTTP returns HTTP 503 Service Unavailable');
-        const noKeyJson: any = await noKeyRes.json();
-        assert(noKeyJson.error.includes('AI Copilot provider is not configured'), 'HTTP 503 error explains configuration requirement');
+        // Temporarily clear provider keys to verify unconfigured behavior
+        const savedKeys = {
+          OPENAI_API_KEY: process.env['OPENAI_API_KEY'],
+          ANTHROPIC_API_KEY: process.env['ANTHROPIC_API_KEY'],
+          GEMINI_API_KEY: process.env['GEMINI_API_KEY'],
+          LLM_API_KEY: process.env['LLM_API_KEY'],
+        };
+        delete process.env['OPENAI_API_KEY'];
+        delete process.env['ANTHROPIC_API_KEY'];
+        delete process.env['GEMINI_API_KEY'];
+        delete process.env['LLM_API_KEY'];
+        try {
+          const noKeyRes = await fetch(`${baseUrl}/copilot/chat`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-test-user-id': userAId,
+            },
+            body: JSON.stringify({ question: 'How many active campaigns?' }),
+          });
+          assert(noKeyRes.status === 503, 'Unconfigured provider via HTTP returns HTTP 503 Service Unavailable');
+          const noKeyJson: any = await noKeyRes.json();
+          assert(noKeyJson.error.includes('AI Copilot provider is not configured'), 'HTTP 503 error explains configuration requirement');
+        } finally {
+          if (savedKeys.OPENAI_API_KEY !== undefined) process.env['OPENAI_API_KEY'] = savedKeys.OPENAI_API_KEY;
+          if (savedKeys.ANTHROPIC_API_KEY !== undefined) process.env['ANTHROPIC_API_KEY'] = savedKeys.ANTHROPIC_API_KEY;
+          if (savedKeys.GEMINI_API_KEY !== undefined) process.env['GEMINI_API_KEY'] = savedKeys.GEMINI_API_KEY;
+          if (savedKeys.LLM_API_KEY !== undefined) process.env['LLM_API_KEY'] = savedKeys.LLM_API_KEY;
+        }
       } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));
       }
     } finally {
+      // Clean up seeded BullMQ jobs and test queue
+      try { if (seededJobA) await seededJobA.remove(); } catch (_) {}
+      try { if (seededJobB) await seededJobB.remove(); } catch (_) {}
+      try { await testEmailQueue.obliterate({ force: true }); } catch (_) {}
+      try { await testEmailQueue.close(); } catch (_) {}
+
       // 6. Clean up isolated test database
       console.log('\n6. Cleaning up isolated test database...');
       try { await testClient.end(); } catch (_) {}
@@ -920,7 +954,6 @@ async function runBatch7BVerification(): Promise<void> {
     }
 
     try {
-      await emailQueue.close();
       await redis.quit();
     } catch (_) {}
 

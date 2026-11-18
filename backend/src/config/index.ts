@@ -103,4 +103,12 @@ export const config = {
       .filter(Boolean),
     boardEnabled: process.env['BULL_BOARD_ENABLED'] !== 'false',
   },
+
+  // ─── AI Delivery Operations Copilot ──────────────────────────────────────────
+  copilot: {
+    geminiApiKey: process.env['GEMINI_API_KEY'] ?? '',
+    geminiModel: (process.env['GEMINI_MODEL'] ?? 'gemini-3.1-flash-lite').replace(/^models\//i, '').trim(),
+    openaiApiKey: process.env['OPENAI_API_KEY'] ?? '',
+    anthropicApiKey: process.env['ANTHROPIC_API_KEY'] ?? '',
+  },
 } as const;

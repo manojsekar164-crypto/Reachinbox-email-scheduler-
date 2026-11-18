@@ -250,6 +250,182 @@ export async function recoverFutureScheduledDeliveries(
   return count;
 }
 
+export interface ScheduledReconciliationResult {
+  checked: number;
+  enqueued: number;
+  alreadyQueued: number;
+  deliveries: Array<{
+    deliveryId: string;
+    campaignId: string;
+    recipientId: string;
+    jobId: string;
+    delayMs: number;
+    status: 'enqueued' | 'already_queued';
+  }>;
+}
+
+/**
+ * Reconciles legitimate scheduled email deliveries from PostgreSQL into BullMQ.
+ *
+ * Scans PostgreSQL for legitimate scheduled deliveries (status = 'scheduled',
+ * campaign status = 'scheduled', not soft-deleted, attempt_count = 0).
+ *
+ * For each delivery:
+ *  1. Checks if a job already exists in BullMQ (via deterministic jobId: campaign_<campaignId>_<recipientId>).
+ *  2. If missing, computes delayMs (clamped to 0 if due/past-due) and enqueues canonical BullMQ job.
+ *  3. Synchronizes delivery_outbox state to 'dispatched' so PostgreSQL and BullMQ remain consistent.
+ *
+ * Invariants:
+ *  - Idempotent: safe to run repeatedly; duplicate jobs are strictly prevented.
+ *  - Strictly excludes 'sent', 'failed', 'unknown', 'cancelled', and 'draft' deliveries.
+ *  - Preserves exact scheduled timestamps, due times, and delivery relationships.
+ */
+export async function reconcileScheduledDeliveries(
+  client: Pool | PoolClient = defaultPool,
+  queue: Queue<EmailJobPayload> = defaultQueue
+): Promise<ScheduledReconciliationResult> {
+  const query = `
+    SELECT
+      ed.id AS delivery_id,
+      ed.campaign_id,
+      ed.recipient_id,
+      ed.scheduled_at,
+      ed.status AS delivery_status,
+      c.status AS campaign_status,
+      c.scheduled_at AS campaign_scheduled_at
+    FROM email_deliveries ed
+    JOIN campaigns c ON c.id = ed.campaign_id
+    WHERE ed.status = 'scheduled'
+      AND c.status = 'scheduled'
+      AND ed.deleted_at IS NULL
+      AND ed.attempt_count = 0
+    ORDER BY ed.created_at ASC;
+  `;
+
+  const result = await client.query<{
+    delivery_id: string;
+    campaign_id: string;
+    recipient_id: string;
+    scheduled_at: Date | string | null;
+    delivery_status: string;
+    campaign_status: string;
+    campaign_scheduled_at: Date | string | null;
+  }>(query);
+
+  const rows = result.rows;
+  let enqueued = 0;
+  let alreadyQueued = 0;
+  const deliverySummary: ScheduledReconciliationResult['deliveries'] = [];
+
+  for (const row of rows) {
+    const deliveryId: string = row.delivery_id;
+    const campaignId: string = row.campaign_id;
+    const recipientId: string = row.recipient_id;
+    const rawScheduledAt = row.scheduled_at || row.campaign_scheduled_at;
+    const scheduledAt: string | null = rawScheduledAt ? new Date(rawScheduledAt).toISOString() : null;
+
+    const deduplicationKey = `campaign_${campaignId}_${recipientId}`;
+
+    // 1. Check if job already exists in BullMQ (idempotency check)
+    const existingJob = await queue.getJob(deduplicationKey);
+    if (existingJob) {
+      alreadyQueued++;
+      deliverySummary.push({
+        deliveryId,
+        campaignId,
+        recipientId,
+        jobId: deduplicationKey,
+        delayMs: existingJob.delay || 0,
+        status: 'already_queued',
+      });
+      continue;
+    }
+
+    // 2. Calculate delayMs based on scheduledAt
+    let delayMs = 0;
+    if (scheduledAt) {
+      const scheduledTime = new Date(scheduledAt).getTime();
+      const now = Date.now();
+      delayMs = Math.max(0, scheduledTime - now);
+    }
+
+    // 3. Publish canonical job to BullMQ with deterministic deduplication key
+    await queue.add(
+      'send-email',
+      {
+        campaignId,
+        recipientId,
+        deliveryId,
+      },
+      {
+        jobId: deduplicationKey,
+        delay: delayMs,
+      }
+    );
+
+    // 4. Upsert outbox record to 'dispatched' to maintain strict outbox-queue consistency
+    await client.query(
+      `INSERT INTO delivery_outbox (
+         event_type,
+         aggregate_id,
+         deduplication_key,
+         payload,
+         status,
+         dispatched_at,
+         available_at,
+         created_at
+       )
+       VALUES (
+         'email.dispatch',
+         $1,
+         $2,
+         $3,
+         'dispatched',
+         NOW(),
+         NOW(),
+         NOW()
+       )
+       ON CONFLICT (deduplication_key) DO UPDATE
+         SET status = 'dispatched',
+             dispatched_at = NOW(),
+             claim_owner = NULL,
+             lease_expires_at = NULL,
+             last_error = NULL`,
+      [
+        deliveryId,
+        deduplicationKey,
+        JSON.stringify({
+          deliveryId,
+          campaignId,
+          recipientId,
+          scheduledAt,
+        }),
+      ]
+    );
+
+    enqueued++;
+    deliverySummary.push({
+      deliveryId,
+      campaignId,
+      recipientId,
+      jobId: deduplicationKey,
+      delayMs,
+      status: 'enqueued',
+    });
+  }
+
+  if (enqueued > 0) {
+    console.log(`📦 [ScheduledReconciliation] Reconciled ${enqueued} missing scheduled deliveries into BullMQ.`);
+  }
+
+  return {
+    checked: rows.length,
+    enqueued,
+    alreadyQueued,
+    deliveries: deliverySummary,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Background Publisher Poller (In-Memory Daemon)
 // ---------------------------------------------------------------------------
@@ -288,6 +464,9 @@ export function startOutboxPublisher(options?: { intervalMs?: number; batchSize?
   // Run initial reconciliation on startup
   recoverFutureScheduledDeliveries().catch((err) => {
     console.error(`❌ [OutboxPublisher] Initial recovery failed: ${err.message}`);
+  });
+  reconcileScheduledDeliveries().catch((err) => {
+    console.error(`❌ [OutboxPublisher] Initial scheduled reconciliation failed: ${err.message}`);
   });
 }
 

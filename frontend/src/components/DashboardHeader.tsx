@@ -1,13 +1,14 @@
 import React from 'react';
-import { Mail, Calendar, CheckCircle2, Search, Plus, MessageSquare, ExternalLink, Shield } from 'lucide-react';
+import { Mail, Calendar, CheckCircle2, Search, Plus, MessageSquare, ExternalLink, Shield, AlertTriangle, Sparkles } from 'lucide-react';
 import type { SlackStatus } from '../types';
 import { UserMenu } from './UserMenu';
 
 interface DashboardHeaderProps {
-  activeTab: 'scheduled' | 'sent' | 'search';
-  onTabChange: (tab: 'scheduled' | 'sent' | 'search') => void;
+  activeTab: 'scheduled' | 'sent' | 'recovery' | 'search';
+  onTabChange: (tab: 'scheduled' | 'sent' | 'recovery' | 'search') => void;
   onComposeClick: () => void;
   onOpenSenders: () => void;
+  onOpenCopilot: () => void;
   slackStatus: SlackStatus | null;
   onSlackConnect: () => void;
   onSlackDisconnect: () => void;
@@ -19,6 +20,7 @@ export const DashboardHeader: React.FC<DashboardHeaderProps> = ({
   onTabChange,
   onComposeClick,
   onOpenSenders,
+  onOpenCopilot,
   slackStatus,
   onSlackConnect,
   onSlackDisconnect,
@@ -66,6 +68,17 @@ export const DashboardHeader: React.FC<DashboardHeaderProps> = ({
               <span>Sent Logs</span>
             </button>
             <button
+              onClick={() => onTabChange('recovery')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                activeTab === 'recovery'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/40'
+              }`}
+            >
+              <AlertTriangle className="w-3.5 h-3.5 text-rose-600" />
+              <span>Recovery Center</span>
+            </button>
+            <button
               onClick={() => onTabChange('search')}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
                 activeTab === 'search'
@@ -80,6 +93,16 @@ export const DashboardHeader: React.FC<DashboardHeaderProps> = ({
 
           {/* Right Area: Senders + Slack + Compose CTA + User Menu */}
           <div className="flex items-center gap-2 sm:gap-2.5">
+            {/* AI Copilot Button */}
+            <button
+              onClick={onOpenCopilot}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-indigo-200 bg-gradient-to-r from-indigo-50 to-indigo-100/60 hover:from-indigo-100 hover:to-indigo-200/60 text-indigo-700 text-xs font-bold transition-all shadow-xs"
+              title="Launch AI Delivery Operations Copilot"
+            >
+              <Sparkles className="w-3.5 h-3.5 text-indigo-600 animate-pulse" />
+              <span className="hidden md:inline">AI Copilot</span>
+            </button>
+
             {/* Senders Button */}
             <button
               onClick={onOpenSenders}

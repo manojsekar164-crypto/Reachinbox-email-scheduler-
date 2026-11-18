@@ -49,6 +49,7 @@ import {
   RunPreflightInput,
   RecipientInputItem,
   BottleneckReason,
+  ImportDiagnosticsInput,
 } from '../types/preflight.types';
 import { SenderRow, CampaignRow } from '../types/db.types';
 
@@ -271,6 +272,7 @@ export interface ValidateRecipientsOptions {
   rawContent?: string;
   recipients?: RecipientInputItem[];
   maxUploadSizeBytes?: number;
+  importDiagnostics?: ImportDiagnosticsInput;
 }
 
 /**
@@ -442,11 +444,46 @@ export async function validateRecipients(
     });
   }
 
+  let totalRows = candidateRows.length;
+  let invalidCount = invalid.length;
+  let duplicateCount = duplicates.length;
+
+  // Merge CSV import diagnostics if provided (preserves CSV diagnostics when submitting filtered recipients)
+  if (options.importDiagnostics) {
+    const diag = options.importDiagnostics;
+    if (Array.isArray(diag.invalid) && diag.invalid.length > 0) {
+      for (const inv of diag.invalid) {
+        if (!invalid.some((e) => e.row === inv.row && e.email === inv.email)) {
+          invalid.push(inv);
+        }
+      }
+    }
+    if (Array.isArray(diag.duplicates) && diag.duplicates.length > 0) {
+      for (const dup of diag.duplicates) {
+        if (!duplicates.some((e) => e.row === dup.row && e.email === dup.email)) {
+          duplicates.push(dup);
+        }
+      }
+    }
+    const diagInvalidCount = diag.invalid_count ?? (Array.isArray(diag.invalid) ? diag.invalid.length : 0);
+    const diagDuplicateCount = diag.duplicate_count ?? (Array.isArray(diag.duplicates) ? diag.duplicates.length : 0);
+    const diagTotalRows =
+      diag.total_rows ?? (valid.length + diagInvalidCount + diagDuplicateCount + existing.length);
+
+    invalidCount = Math.max(invalid.length, diagInvalidCount);
+    duplicateCount = Math.max(duplicates.length, diagDuplicateCount);
+    totalRows = Math.max(
+      candidateRows.length,
+      diagTotalRows,
+      valid.length + invalidCount + duplicateCount + existing.length
+    );
+  }
+
   const counts: ValidationCounts = {
-    total_rows: candidateRows.length,
+    total_rows: totalRows,
     valid_count: valid.length,
-    invalid_count: invalid.length,
-    duplicate_count: duplicates.length,
+    invalid_count: invalidCount,
+    duplicate_count: duplicateCount,
     existing_count: existing.length,
   };
 
@@ -561,9 +598,10 @@ export interface CalculateCapacityOptions {
  *  - 100% read-only.
  */
 export async function calculateCapacityAndForecast(
-  options: CalculateCapacityOptions,
+  options: CalculateCapacityOptions & { queue?: any },
   dbClient: Pool | Client = db,
-  redisClient: Redis = defaultRedis
+  redisClient: Redis = defaultRedis,
+  queue?: any
 ): Promise<{
   capacity: PreflightCapacityResult;
   forecast: DeliveryForecastResult;
@@ -653,7 +691,8 @@ export async function calculateCapacityAndForecast(
   // 7. Queued Work (Active / Waiting Jobs in BullMQ)
   let queuedJobsCount = 0;
   try {
-    const counts = await emailQueue.getJobCounts('waiting', 'active');
+    const q = options?.queue || queue || emailQueue;
+    const counts = await q.getJobCounts('waiting', 'active');
     queuedJobsCount = (counts['waiting'] || 0) + (counts['active'] || 0);
   } catch (err: any) {
     queuedJobsCount = 0;
@@ -762,7 +801,7 @@ export async function calculateCapacityAndForecast(
       rateDurationMs = resetWaitMs + fullHours * 3600000 + remInLastHour * sendDelayMs;
 
       const constraintNames = resetWaitInfo.exhaustedConstraints
-        .map((c) => c.replace(/_/g, ' '))
+        .map((c) => c.replace(/_/g, ' ').replace(/\s*limit\s*$/i, '') + ' limit')
         .join(' and ');
       warnings.push(
         `Current hourly rate limit is exhausted for ${constraintNames}. ` +
@@ -786,11 +825,11 @@ export async function calculateCapacityAndForecast(
         (remInLastHour - 1) * sendDelayMs;
 
       const constraintNames = resetWaitInfo.exhaustedConstraints
-        .map((c) => c.replace(/_/g, ' '))
+        .map((c) => c.replace(/_/g, ' ').replace(/\s*limit\s*$/i, '') + ' limit')
         .join(' and ');
       warnings.push(
         `Recipient count (${N}) exceeds current hour remaining capacity (${currentHourRemaining}). ` +
-          `Delivery will span multiple hours due to ${constraintNames} limit.`
+          `Delivery will span multiple hours due to ${constraintNames}.`
       );
     }
 
@@ -807,6 +846,28 @@ export async function calculateCapacityAndForecast(
   const estimatedCompletionAt = new Date(startMs + durationMs).toISOString();
   const estimatedDurationSeconds = Math.ceil(durationMs / 1000);
 
+  let explanation = '';
+  if (N === 0) {
+    explanation = '0 recipients to dispatch. Projected duration is 0 seconds.';
+  } else if (N === 1) {
+    explanation = 'Single recipient will dispatch immediately upon worker pickup (0s spacing delay).';
+  } else if (currentHourRemaining <= 0) {
+    const constraintNames = resetWaitInfo.exhaustedConstraints
+      .map((c) => c.replace(/_/g, ' ').replace(/\s*limit\s*$/i, '') + ' limit')
+      .join(' and ');
+    explanation = `Current hourly quota for ${constraintNames} is exhausted. Dispatches will commence after window reset in approximately ${Math.ceil(resetWaitInfo.resetWaitMs / 60000)} minutes.`;
+  } else if (N <= currentHourRemaining) {
+    explanation = `All ${N} recipient(s) fit within current hour window (${currentHourRemaining} remaining of ${effectiveHourlyRate}/hr limit). Projected duration of ${estimatedDurationSeconds}s is governed by ${sendDelayMs}ms (${sendDelayMs / 1000}s) inter-send spacing.`;
+  } else {
+    const constraintNames = resetWaitInfo.exhaustedConstraints
+      .map((c) => c.replace(/_/g, ' ').replace(/\s*limit\s*$/i, '') + ' limit')
+      .join(' and ');
+    explanation = `Recipient count (${N}) exceeds current hour window capacity (${currentHourRemaining} remaining). First ${currentHourRemaining} emails dispatch with ${sendDelayMs}ms (${sendDelayMs / 1000}s) spacing; remaining ${N - currentHourRemaining} email(s) dispatch across future window(s) after ${constraintNames} reset.`;
+  }
+
+  assumptions.push(`Inter-send spacing of ${sendDelayMs}ms enforced between consecutive dispatches.`);
+  assumptions.push(`Hourly limit of ${effectiveHourlyRate} emails/hr enforced as hourly window quota ceiling.`);
+
   const forecast: DeliveryForecastResult = {
     recipient_count: N,
     estimated_start_at: estimatedStartAt,
@@ -814,6 +875,7 @@ export async function calculateCapacityAndForecast(
     estimated_duration_seconds: estimatedDurationSeconds,
     is_approximate: true,
     confidence: 'approximate',
+    explanation,
     assumptions,
     warnings,
   };
@@ -901,9 +963,10 @@ export async function calculateCapacityAndForecast(
  * Invariant: 100% read-only.
  */
 export async function runPreflight(
-  input: RunPreflightInput,
+  input: RunPreflightInput & { queue?: any },
   dbClient: Pool | Client = db,
-  redisClient: Redis = defaultRedis
+  redisClient: Redis = defaultRedis,
+  queue?: any
 ): Promise<PreflightResult> {
   const {
     userId,
@@ -940,6 +1003,7 @@ export async function runPreflight(
       rawContent: content,
       recipients,
       maxUploadSizeBytes,
+      importDiagnostics: input.importDiagnostics,
     },
     dbClient
   );
@@ -958,9 +1022,11 @@ export async function runPreflight(
       hourlyLimit,
       scheduledAt,
       recipientCount: effectiveRecipientCount,
+      queue: input.queue || queue,
     },
     dbClient,
-    redisClient
+    redisClient,
+    input.queue || queue
   );
 
   return {

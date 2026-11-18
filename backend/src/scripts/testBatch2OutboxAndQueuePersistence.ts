@@ -78,8 +78,9 @@ async function runBatch2Verification(): Promise<void> {
   });
   await adminClient.connect();
 
-  // Test Queue instance connected to Redis
-  const testQueue = new Queue<EmailJobPayload>(emailQueueName, {
+  // Test Queue instance connected to Redis (isolated queue for Batch 2)
+  const TEST_QUEUE_NAME = `${emailQueueName}-b2-${Date.now()}`;
+  const testQueue = new Queue<EmailJobPayload>(TEST_QUEUE_NAME, {
     connection: redisConnectionOptions,
   });
 
@@ -635,6 +636,7 @@ async function runBatch2Verification(): Promise<void> {
     }
 
   } finally {
+    try { await testQueue.obliterate({ force: true }); } catch (_) {}
     await testQueue.close();
     await adminClient.end();
   }

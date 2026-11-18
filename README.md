@@ -152,12 +152,35 @@ Frontend UI will start on `http://localhost:5173`.
 - `GET /auth/slack/status` — Get current user's Slack connection status (workspace and channel name).
 - `DELETE /auth/slack` — Disconnect Slack workspace and remove webhook.
 
-### 📮 Senders Management (`/senders`)
+### 📮 Senders Management & Health Monitor (`/senders`)
 - `GET /senders` — List all configured SMTP senders for authenticated user.
 - `POST /senders` — Add new SMTP sender account (with credentials).
 - `GET /senders/:id` — Get sender details by ID.
 - `PATCH /senders/:id` — Update sender configuration.
 - `DELETE /senders/:id` — Delete sender account (restricted if referenced by active campaigns).
+- `GET /senders/health` — Fleet-wide aggregate health summary (reputation score, healthy/degraded/quarantined counts).
+- `GET /senders/:id/health` — Detailed sender health metrics (acceptance rate, bounce rate, transient failure rate, hourly quota usage).
+- `POST /senders/:id/probe` — Live non-destructive SMTP connectivity, strict TLS handshake, and authentication diagnostic probe.
+
+### 🛡️ Delivery Failure & Recovery Center (`/deliveries`)
+- `GET /deliveries` — Query delivery records with status, campaign, and error classification filters.
+- `GET /deliveries/failed` — Filter confirmed delivery failures.
+- `GET /deliveries/unknown` — Filter ambiguous SMTP outcomes requiring operator review.
+- `GET /deliveries/:id` — Get delivery details and retry eligibility.
+- `GET /deliveries/:id/attempts` — Immutable attempt audit log with genuine SMTP response codes.
+- `POST /deliveries/:id/retry` — Safe manual retry for eligible transient failures.
+- `POST /deliveries/:id/resolve` — Operator resolution for unknown deliveries (`confirmed_delivered` or `confirmed_failed`).
+
+### 🎯 Smart Campaign Preflight & Forecast (`/preflight`, `/campaigns`)
+- `POST /preflight` — Non-destructive preflight validation: audience syntax/duplicate check, sender capacity, and duration forecast.
+- `POST /campaigns/:id/preflight` — Run preflight check for existing campaign.
+- `POST /campaigns/:id/pause` — Pause active campaign dispatches.
+- `POST /campaigns/:id/resume` — Resume paused campaign dispatches.
+- `POST /campaigns/:id/cancel` — Atomically cancel remaining campaign dispatches while preserving in-flight sends.
+- `GET /campaigns/:id/deliveries` — Query real-time delivery statuses for a specific campaign.
+
+### 🤖 AI Delivery Operations Copilot (`/copilot`)
+- `POST /copilot/chat` — Authenticated, grounded operational Q&A backed by real campaign telemetry, failure metrics, and queue bottlenecks.
 
 ### 🚀 Campaigns & Job Dispatch (`/campaigns`)
 - `GET /campaigns` — List user's email campaigns with status and stats.
@@ -192,6 +215,13 @@ The project includes 12 automated verification suites covering every subsystem:
 | `npm run sender:test` | Multi-sender isolation, per-campaign sender routing, delete protection |
 | `npm run scheduled-recovery:test`| Exact-time scheduled job survival across worker restarts |
 | `npm run load:test` | 1000-job stress test: concurrency 10, rate limiting, zero dropped jobs |
+| `npm run batch5:test` | Batch 5: Smart Campaign Preflight & Delivery Forecast (142 scenarios) |
+| `npm run batch6:test` | Batch 6 & 6.1: Delivery Failure & Campaign Lifecycle Controls (107 scenarios) |
+| `npm run batch7A:test`| Batch 7A: Operations Intelligence Data Service (119 scenarios) |
+| `npm run batch7B:test`| Batch 7B: AI Delivery Operations Copilot (63 scenarios) |
+| `npm run batch8:test` | Batch 8: Bull Board Security & Admin Authorization (52 scenarios) |
+| `npm run batch9.1:test`| Batch 9.1: Slack OAuth State Security & Notification Reliability (43 scenarios) |
+| `npm run batch10:test`| Batch 10: Sender Health Monitor & Live SMTP Diagnostics (83 scenarios) |
 
 Run all tests from the backend folder:
 ```bash

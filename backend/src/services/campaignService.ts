@@ -209,12 +209,30 @@ export async function createCampaignWithRecipients(
 
 export async function listCampaignsByUser(
   userId: string,
-): Promise<CampaignRow[]> {
-  const { rows } = await db.query<CampaignRow>(
-    `SELECT * FROM campaigns WHERE user_id = $1 ORDER BY created_at DESC`,
+): Promise<(CampaignRow & { recipient_count: number; recipients_count: number })[]> {
+  const { rows } = await db.query<
+    CampaignRow & { recipient_count: string | number; recipients_count?: string | number }
+  >(
+    `SELECT c.*,
+            COALESCE(r.recipient_count, 0)::int AS recipient_count,
+            COALESCE(r.recipient_count, 0)::int AS recipients_count
+     FROM campaigns c
+     LEFT JOIN (
+       SELECT r_inner.campaign_id, COUNT(*)::int AS recipient_count
+       FROM recipients r_inner
+       JOIN campaigns c_inner ON c_inner.id = r_inner.campaign_id
+       WHERE c_inner.user_id = $1
+       GROUP BY r_inner.campaign_id
+     ) r ON r.campaign_id = c.id
+     WHERE c.user_id = $1
+     ORDER BY c.created_at DESC`,
     [userId],
   );
-  return rows;
+  return rows.map((row) => ({
+    ...row,
+    recipient_count: Number(row.recipient_count || 0),
+    recipients_count: Number(row.recipient_count || 0),
+  }));
 }
 
 // =============================================================================

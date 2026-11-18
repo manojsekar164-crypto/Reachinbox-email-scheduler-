@@ -129,6 +129,16 @@ export async function preflightCampaignHandler(
       }
     }
 
+    const rawImportDiagnostics =
+      body['import_diagnostics'] ??
+      body['importDiagnostics'] ??
+      body['diagnostics'];
+
+    let importDiagnostics: any = undefined;
+    if (rawImportDiagnostics && typeof rawImportDiagnostics === 'object') {
+      importDiagnostics = rawImportDiagnostics;
+    }
+
     if (content === undefined && recipients === undefined) {
       errors.push('Either csv_content or recipients array is required');
     }
@@ -146,9 +156,10 @@ export async function preflightCampaignHandler(
       scheduledAt,
       content,
       recipients,
+      importDiagnostics,
     };
 
-    const result = await runPreflight(input);
+    const result = await runPreflight({ ...input, queue: (req as any).queue });
     res.status(200).json(result);
   } catch (err: any) {
     if (

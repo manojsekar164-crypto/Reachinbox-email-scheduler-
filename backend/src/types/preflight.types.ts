@@ -106,6 +106,7 @@ export interface DeliveryForecastResult {
   estimated_duration_seconds: number;
   is_approximate: boolean;
   confidence: 'approximate' | 'exact';
+  explanation?: string;
   assumptions: string[];
   warnings: string[];
 }
@@ -133,6 +134,15 @@ export interface RecipientInputItem {
   name?: string;
 }
 
+export interface ImportDiagnosticsInput {
+  total_rows?: number;
+  valid_count?: number;
+  invalid_count?: number;
+  duplicate_count?: number;
+  invalid?: InvalidRecipientRow[];
+  duplicates?: DuplicateRecipientRow[];
+}
+
 export interface RunPreflightInput {
   userId: string;
   senderId?: string;
@@ -143,4 +153,5 @@ export interface RunPreflightInput {
   recipients?: RecipientInputItem[];
   recipientCount?: number;
   maxUploadSizeBytes?: number;
+  importDiagnostics?: ImportDiagnosticsInput;
 }

@@ -98,7 +98,7 @@ export async function copilotChatHandler(
     }
 
     if (err instanceof CopilotProviderError || err.statusCode === 502) {
-      res.status(502).json({ error: err.message });
+      res.status(err.statusCode || 502).json({ error: err.message });
       return;
     }
 

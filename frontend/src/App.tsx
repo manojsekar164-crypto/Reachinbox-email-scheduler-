@@ -10,6 +10,8 @@ import { LoginView } from './pages/LoginView';
 import { ScheduledListView } from './pages/ScheduledListView';
 import { SentListView } from './pages/SentListView';
 import { SearchView } from './pages/SearchView';
+import { RecoveryCenterView } from './pages/RecoveryCenterView';
+import { AiCopilotModal } from './components/AiCopilotModal';
 import type { Campaign, Sender, SearchResultItem, SlackStatus } from './types';
 import { campaignApi, senderApi, emailApi, slackApi } from './services/api';
 
@@ -17,9 +19,10 @@ export const App: React.FC = () => {
   const { authenticated, loading: authLoading } = useAuth();
   const { success, error, info } = useToast();
 
-  const [activeTab, setActiveTab] = useState<'scheduled' | 'sent' | 'search'>('scheduled');
+  const [activeTab, setActiveTab] = useState<'scheduled' | 'sent' | 'recovery' | 'search'>('scheduled');
   const [isComposeOpen, setIsComposeOpen] = useState(false);
   const [isSendersOpen, setIsSendersOpen] = useState(false);
+  const [isCopilotOpen, setIsCopilotOpen] = useState(false);
 
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
   const [senders, setSenders] = useState<Sender[]>([]);
@@ -140,7 +143,10 @@ export const App: React.FC = () => {
   ).length;
   const sentCount = sentLogs.length;
   const failedCount = failedLogs.length;
-  const totalRecipientsCount = sentCount + failedCount + campaigns.reduce((acc, c) => acc + (c.recipients?.length || 1), 0);
+  const totalRecipientsCount = campaigns.reduce(
+    (acc, c) => acc + (c.recipient_count ?? c.recipients_count ?? c.recipients?.length ?? 0),
+    0
+  );
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col font-sans selection:bg-indigo-600 selection:text-white">
@@ -150,6 +156,7 @@ export const App: React.FC = () => {
         onTabChange={setActiveTab}
         onComposeClick={() => setIsComposeOpen(true)}
         onOpenSenders={() => setIsSendersOpen(true)}
+        onOpenCopilot={() => setIsCopilotOpen(true)}
         slackStatus={slackStatus}
         onSlackConnect={handleSlackConnect}
         onSlackDisconnect={handleSlackDisconnect}
@@ -209,6 +216,8 @@ export const App: React.FC = () => {
           />
         )}
 
+        {activeTab === 'recovery' && <RecoveryCenterView />}
+
         {activeTab === 'search' && <SearchView />}
       </main>
 
@@ -230,6 +239,12 @@ export const App: React.FC = () => {
         onClose={() => setIsSendersOpen(false)}
         senders={senders}
         onSendersUpdated={loadSenders}
+      />
+
+      {/* AI Operations Copilot Modal */}
+      <AiCopilotModal
+        isOpen={isCopilotOpen}
+        onClose={() => setIsCopilotOpen(false)}
       />
     </div>
   );

@@ -1,6 +1,9 @@
 import React, { useState } from 'react';
 import Papa from 'papaparse';
-import { X, Upload, Users, Calendar, Shield, Send } from 'lucide-react';
+import { X, Upload, Users, Calendar, Shield, Send, Gauge, FileCheck } from 'lucide-react';
+import { PreflightModal } from './PreflightModal';
+import type { PreflightResponse, ImportDiagnostics } from '../types';
+import { preflightApi } from '../services/api';
 import type { Sender, CreateCampaignPayload } from '../types';
 import { campaignApi } from '../services/api';
 import { useToast } from '../context/ToastContext';
@@ -31,6 +34,41 @@ export const ComposeEmailModal: React.FC<ComposeEmailModalProps> = ({
   const [manualEmail, setManualEmail] = useState('');
   const [loading, setLoading] = useState(false);
   const [fileName, setFileName] = useState('');
+  const [rawCsvContent, setRawCsvContent] = useState<string | null>(null);
+  const [importDiagnostics, setImportDiagnostics] = useState<ImportDiagnostics | null>(null);
+  const [isPreflightOpen, setIsPreflightOpen] = useState(false);
+  const [preflightData, setPreflightData] = useState<PreflightResponse | null>(null);
+  const [preflightLoading, setPreflightLoading] = useState(false);
+
+  const handleRunPreflight = async () => {
+    if (!senderId) {
+      error('Please select an active sender profile before running preflight');
+      return;
+    }
+    if (recipients.length === 0) {
+      error('Please add at least one recipient before running preflight check');
+      return;
+    }
+
+    try {
+      setPreflightLoading(true);
+      setIsPreflightOpen(true);
+      const res = await preflightApi.run({
+        sender_id: senderId,
+        hourly_limit: Math.max(1, Math.min(1000, Number(hourlyLimit) || 100)),
+        scheduled_at: scheduledAt ? new Date(scheduledAt).toISOString() : null,
+        recipients,
+        csv_content: rawCsvContent || undefined,
+        import_diagnostics: importDiagnostics || undefined,
+      });
+      setPreflightData(res);
+    } catch (err: any) {
+      error(err.message || 'Preflight check failed');
+      setIsPreflightOpen(false);
+    } finally {
+      setPreflightLoading(false);
+    }
+  };
 
   // Synchronize senderId if senders list updates
   React.useEffect(() => {
@@ -48,37 +86,122 @@ export const ComposeEmailModal: React.FC<ComposeEmailModalProps> = ({
     if (!file) return;
 
     setFileName(file.name);
-    Papa.parse(file, {
-      header: true,
-      skipEmptyLines: true,
-      complete: (results) => {
-        const parsedRecipients: { email: string; name?: string }[] = [];
-        const seen = new Set<string>();
 
-        results.data.forEach((row: any) => {
-          const emailKey = Object.keys(row).find((k) => k.toLowerCase().includes('email'));
-          const nameKey = Object.keys(row).find((k) => k.toLowerCase().includes('name'));
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const text = (event.target?.result as string) || '';
+      setRawCsvContent(text);
 
-          const emailVal = emailKey ? String(row[emailKey]).trim().toLowerCase() : '';
-          const nameVal = nameKey ? String(row[nameKey]).trim() : undefined;
+      if (text.includes('\0')) {
+        error('Malformed or unreadable content (binary or null byte detected)');
+        return;
+      }
 
-          if (emailVal && EMAIL_RE.test(emailVal) && !seen.has(emailVal)) {
-            seen.add(emailVal);
-            parsedRecipients.push({ email: emailVal, name: nameVal });
+      Papa.parse(text, {
+        header: true,
+        skipEmptyLines: 'greedy',
+        complete: (results) => {
+          const fields = results.meta.fields || [];
+          const emailCol = fields.find((f: string) => {
+            const clean = f.toLowerCase().replace(/[^a-z0-9]/g, '');
+            return ['email', 'emailaddress', 'recipient', 'recipientemail', 'mail', 'to'].includes(clean);
+          });
+          const nameCol = fields.find((f: string) => {
+            const clean = f.toLowerCase().replace(/[^a-z0-9]/g, '');
+            return ['name', 'fullname', 'recipientname', 'firstname'].includes(clean);
+          });
+
+          if (!results.data || results.data.length === 0) {
+            warning('File is empty.');
+            return;
           }
-        });
 
-        if (parsedRecipients.length > 0) {
-          setRecipients(parsedRecipients);
-          success(`Imported ${parsedRecipients.length} valid recipient(s) from ${file.name}`);
-        } else {
-          warning('No valid email addresses found in file. Please ensure columns include "email".');
-        }
-      },
-      error: (err) => {
-        error(`Failed to parse file: ${err.message}`);
-      },
-    });
+          if (!emailCol && fields.length > 0) {
+            const looksLikeSchema = fields.some((f) =>
+              /^(name|first|last|id|phone|address|company|age|title|city|state|zip)$/i.test(f.trim())
+            );
+            if (looksLikeSchema) {
+              error("Missing required email column in CSV header. Expected a column named 'email'.");
+              return;
+            }
+          }
+
+          const parsedRecipients: { email: string; name?: string }[] = [];
+          const seen = new Set<string>();
+          const invalidRows: { row: number; email: string; reason: string }[] = [];
+          const duplicateRows: { row: number; email: string; reason: string }[] = [];
+
+          let rowNumber = 1;
+
+          results.data.forEach((row: any) => {
+            rowNumber++;
+            const emailKey = emailCol || Object.keys(row).find((k) => k.toLowerCase().includes('email'));
+            const nameKey = nameCol || Object.keys(row).find((k) => k.toLowerCase().includes('name'));
+
+            const rawEmailVal = emailKey ? String(row[emailKey] ?? '').trim() : '';
+            const normalizedEmail = rawEmailVal.toLowerCase();
+            const rawNameVal = nameKey ? String(row[nameKey] ?? '').trim() : undefined;
+
+            if (!rawEmailVal) {
+              invalidRows.push({
+                row: rowNumber,
+                email: '',
+                reason: 'Empty or missing email address',
+              });
+              return;
+            }
+
+            if (!EMAIL_RE.test(normalizedEmail)) {
+              invalidRows.push({
+                row: rowNumber,
+                email: rawEmailVal,
+                reason: 'Invalid email address format',
+              });
+              return;
+            }
+
+            if (seen.has(normalizedEmail)) {
+              duplicateRows.push({
+                row: rowNumber,
+                email: normalizedEmail,
+                reason: 'Duplicate email address within uploaded file',
+              });
+              return;
+            }
+
+            seen.add(normalizedEmail);
+            parsedRecipients.push({ email: normalizedEmail, name: rawNameVal || undefined });
+          });
+
+          const totalDataRows = results.data.length;
+          const diagnostics: ImportDiagnostics = {
+            total_rows: totalDataRows,
+            valid_count: parsedRecipients.length,
+            invalid_count: invalidRows.length,
+            duplicate_count: duplicateRows.length,
+            invalid: invalidRows,
+            duplicates: duplicateRows,
+          };
+
+          setImportDiagnostics(diagnostics);
+
+          if (parsedRecipients.length > 0) {
+            setRecipients(parsedRecipients);
+            const msg = `Imported ${parsedRecipients.length} valid recipient(s)` +
+              (duplicateRows.length > 0 ? ` (${duplicateRows.length} duplicate(s) removed)` : '') +
+              (invalidRows.length > 0 ? ` (${invalidRows.length} invalid rejected)` : '');
+            success(msg);
+          } else {
+            setRecipients([]);
+            warning('No valid email addresses found in file.');
+          }
+        },
+        error: (err: any) => {
+          error(`Failed to parse file: ${err.message}`);
+        },
+      });
+    };
+    reader.readAsText(file);
   };
 
   const handleAddManualRecipient = () => {
@@ -299,6 +422,59 @@ export const ComposeEmailModal: React.FC<ComposeEmailModalProps> = ({
               </label>
             </div>
 
+            {/* CSV Import Diagnostics Summary */}
+            {importDiagnostics && (
+              <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                    <FileCheck className="w-3.5 h-3.5 text-indigo-600" />
+                    <span>CSV Import Summary ({fileName})</span>
+                  </span>
+                  <span className="text-[10px] font-semibold text-slate-500">
+                    {importDiagnostics.total_rows} total rows
+                  </span>
+                </div>
+                <div className="grid grid-cols-3 gap-2 text-center">
+                  <div className="p-2 rounded-lg bg-emerald-50 border border-emerald-100">
+                    <span className="text-[10px] font-bold uppercase text-emerald-700 block">Accepted</span>
+                    <span className="text-base font-extrabold text-emerald-800">{importDiagnostics.valid_count}</span>
+                  </div>
+                  <div className="p-2 rounded-lg bg-rose-50 border border-rose-100">
+                    <span className="text-[10px] font-bold uppercase text-rose-700 block">Invalid</span>
+                    <span className="text-base font-extrabold text-rose-800">{importDiagnostics.invalid_count}</span>
+                  </div>
+                  <div className="p-2 rounded-lg bg-amber-50 border border-amber-100">
+                    <span className="text-[10px] font-bold uppercase text-amber-700 block">Duplicates</span>
+                    <span className="text-base font-extrabold text-amber-800">{importDiagnostics.duplicate_count}</span>
+                  </div>
+                </div>
+                {(importDiagnostics.invalid_count > 0 || importDiagnostics.duplicate_count > 0) && (
+                  <div className="pt-1.5 border-t border-slate-200">
+                    <details className="text-xs text-slate-600 group">
+                      <summary className="font-semibold text-[11px] text-slate-700 cursor-pointer hover:text-indigo-600 flex items-center justify-between">
+                        <span>View Rejected Rows ({importDiagnostics.invalid_count + importDiagnostics.duplicate_count})</span>
+                        <span className="text-[10px] text-indigo-600 group-open:rotate-180 transition-transform">▼</span>
+                      </summary>
+                      <div className="mt-2 max-h-28 overflow-y-auto space-y-1 text-[11px]">
+                        {importDiagnostics.invalid.map((item, idx) => (
+                          <div key={`inv-${idx}`} className="flex items-center justify-between p-1.5 bg-rose-50/70 rounded border border-rose-100 text-rose-800">
+                            <span>Row {item.row}: <code className="font-mono">{item.email || '(empty)'}</code></span>
+                            <span className="text-[10px] opacity-80">{item.reason}</span>
+                          </div>
+                        ))}
+                        {importDiagnostics.duplicates.map((item, idx) => (
+                          <div key={`dup-${idx}`} className="flex items-center justify-between p-1.5 bg-amber-50/70 rounded border border-amber-100 text-amber-800">
+                            <span>Row {item.row}: <code className="font-mono">{item.email}</code></span>
+                            <span className="text-[10px] opacity-80">{item.reason}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </details>
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Manual Email Input */}
             <div className="flex gap-2">
               <input
@@ -408,6 +584,15 @@ export const ComposeEmailModal: React.FC<ComposeEmailModalProps> = ({
           <div className="flex items-center justify-end gap-3 pt-4 border-t border-slate-100">
             <button
               type="button"
+              disabled={recipients.length === 0 || !senderId || preflightLoading}
+              onClick={handleRunPreflight}
+              className="flex items-center gap-1.5 px-4 py-2 rounded-xl border border-indigo-200 bg-indigo-50/80 hover:bg-indigo-100/80 text-indigo-700 text-xs font-bold transition-all disabled:opacity-50 cursor-pointer shadow-xs"
+            >
+              <Gauge className={`w-3.5 h-3.5 ${preflightLoading ? 'animate-spin' : ''}`} />
+              <span>{preflightLoading ? 'Checking...' : 'Preflight Forecast'}</span>
+            </button>
+            <button
+              type="button"
               onClick={onClose}
               className="px-4 py-2 rounded-xl text-xs font-semibold text-slate-600 hover:bg-slate-100 transition-colors cursor-pointer"
             >
@@ -430,6 +615,20 @@ export const ComposeEmailModal: React.FC<ComposeEmailModalProps> = ({
           </div>
         </form>
       </div>
+
+      {/* Preflight Forecast Modal */}
+      <PreflightModal
+        isOpen={isPreflightOpen}
+        onClose={() => setIsPreflightOpen(false)}
+        preflightData={preflightData}
+        loading={preflightLoading}
+        onProceed={() => {
+          setIsPreflightOpen(false);
+          // Trigger actual submission
+          const form = document.querySelector('form');
+          if (form) form.requestSubmit();
+        }}
+      />
     </div>
   );
 };
